@@ -15,6 +15,46 @@ let lastUpdateId = 0;
 let polling = false;
 
 // ==================== DATA SOURCES ====================
+
+// Common ticker to company name lookup (for when API doesn't provide it)
+const TICKER_NAMES = {
+  AAPL: 'Apple Inc', MSFT: 'Microsoft Corp', GOOGL: 'Alphabet Inc', GOOG: 'Alphabet Inc',
+  AMZN: 'Amazon.com Inc', META: 'Meta Platforms', NVDA: 'NVIDIA Corp', TSLA: 'Tesla Inc',
+  AMD: 'Advanced Micro Devices', INTC: 'Intel Corp', CRM: 'Salesforce Inc', ORCL: 'Oracle Corp',
+  NFLX: 'Netflix Inc', DIS: 'Walt Disney Co', PYPL: 'PayPal Holdings', ADBE: 'Adobe Inc',
+  CSCO: 'Cisco Systems', AVGO: 'Broadcom Inc', TXN: 'Texas Instruments', QCOM: 'Qualcomm Inc',
+  IBM: 'IBM Corp', NOW: 'ServiceNow Inc', UBER: 'Uber Technologies', ABNB: 'Airbnb Inc',
+  SQ: 'Block Inc', SHOP: 'Shopify Inc', SNOW: 'Snowflake Inc', PLTR: 'Palantir Technologies',
+  JPM: 'JPMorgan Chase', BAC: 'Bank of America', WFC: 'Wells Fargo', C: 'Citigroup',
+  GS: 'Goldman Sachs', MS: 'Morgan Stanley', BLK: 'BlackRock Inc', SCHW: 'Charles Schwab',
+  V: 'Visa Inc', MA: 'Mastercard Inc', AXP: 'American Express', COF: 'Capital One',
+  JNJ: 'Johnson & Johnson', PFE: 'Pfizer Inc', UNH: 'UnitedHealth Group', MRK: 'Merck & Co',
+  ABBV: 'AbbVie Inc', LLY: 'Eli Lilly', BMY: 'Bristol-Myers Squibb', AMGN: 'Amgen Inc',
+  XOM: 'Exxon Mobil', CVX: 'Chevron Corp', COP: 'ConocoPhillips', SLB: 'Schlumberger',
+  WMT: 'Walmart Inc', COST: 'Costco Wholesale', TGT: 'Target Corp', HD: 'Home Depot',
+  LOW: 'Lowe\'s Companies', MCD: 'McDonald\'s Corp', SBUX: 'Starbucks Corp', NKE: 'Nike Inc',
+  KO: 'Coca-Cola Co', PEP: 'PepsiCo Inc', PM: 'Philip Morris', MO: 'Altria Group',
+  PG: 'Procter & Gamble', CL: 'Colgate-Palmolive', KMB: 'Kimberly-Clark', EL: 'Estée Lauder',
+  BA: 'Boeing Co', LMT: 'Lockheed Martin', RTX: 'Raytheon Technologies', GD: 'General Dynamics',
+  NOC: 'Northrop Grumman', CAT: 'Caterpillar Inc', DE: 'Deere & Company', MMM: '3M Company',
+  GE: 'General Electric', HON: 'Honeywell International', UPS: 'United Parcel Service', FDX: 'FedEx Corp',
+  T: 'AT&T Inc', VZ: 'Verizon Communications', TMUS: 'T-Mobile US', CMCSA: 'Comcast Corp',
+  NEE: 'NextEra Energy', DUK: 'Duke Energy', SO: 'Southern Company', D: 'Dominion Energy',
+  AMT: 'American Tower', PLD: 'Prologis Inc', SPG: 'Simon Property Group', EQIX: 'Equinix Inc',
+  INTU: 'Intuit Inc', ADP: 'Automatic Data Processing', PAYX: 'Paychex Inc', FISV: 'Fiserv Inc',
+  AMAT: 'Applied Materials', LRCX: 'Lam Research', KLAC: 'KLA Corp', MU: 'Micron Technology',
+  IQV: 'IQVIA Holdings', ZTS: 'Zoetis Inc', REGN: 'Regeneron Pharmaceuticals', VRTX: 'Vertex Pharmaceuticals',
+  F: 'Ford Motor Co', GM: 'General Motors', RIVN: 'Rivian Automotive', LCID: 'Lucid Group',
+  AAL: 'American Airlines', DAL: 'Delta Air Lines', UAL: 'United Airlines', LUV: 'Southwest Airlines',
+  SPY: 'SPDR S&P 500 ETF', QQQ: 'Invesco QQQ Trust', IWM: 'iShares Russell 2000', DIA: 'SPDR Dow Jones',
+  VTI: 'Vanguard Total Stock', VOO: 'Vanguard S&P 500', BND: 'Vanguard Total Bond', GLD: 'SPDR Gold Shares',
+};
+
+const getCompanyName = (ticker, description) => {
+  if (description && description !== ticker && description.length > 2) return description;
+  return TICKER_NAMES[ticker] || '';
+};
+
 const SOURCES = [
   {
     name: 'Quiver Quant',
@@ -26,7 +66,7 @@ const SOURCES = [
       state: t.District?.slice(0, 2) || '',
       chamber: t.House === 'Representatives' ? 'house' : 'senate',
       ticker: t.Ticker,
-      company: t.Description || t.Ticker,
+      company: getCompanyName(t.Ticker, t.Description),
       type: t.Transaction,
       date: t.TransactionDate,
       value: parseValue(t.Range),
@@ -42,7 +82,7 @@ const SOURCES = [
       state: t.state || t.district || '',
       chamber: 'house',
       ticker: t.ticker,
-      company: t.asset_description || '',
+      company: getCompanyName(t.ticker, t.asset_description),
       type: t.type || t.transaction_type,
       date: t.transaction_date,
       value: t.amount,
@@ -58,7 +98,7 @@ const SOURCES = [
       state: t.state || '',
       chamber: 'senate',
       ticker: t.ticker,
-      company: t.asset_description || '',
+      company: getCompanyName(t.ticker, t.asset_description),
       type: t.type || t.transaction_type,
       date: t.transaction_date,
       value: t.amount,
@@ -232,6 +272,7 @@ function isRateLimited(chatId) {
 const COMMANDS = {
   async start(chatId, arg) {
     // Handle deep link search (from clicking politician name)
+    // Silently route to search without showing /start was triggered
     if (typeof arg === 'string' && arg.startsWith('search_')) {
       const query = sanitizeQuery(decodeURIComponent(arg.replace('search_', '')));
       if (query) return COMMANDS.search(chatId, query);
