@@ -136,7 +136,11 @@ const SOURCES = [
 const parseValue = str => str?.match(/\$?([\d,]+)/)?.[1]?.replace(/,/g, '') * 1 || null;
 const isGroup = id => id < 0;
 const delay = ms => new Promise(r => setTimeout(r, ms));
-const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
+const log = (...args) => {
+  console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
+  // Force flush for Railway logs
+  if (process.stdout.write) process.stdout.write('');
+};
 
 // Sanitize HTML to prevent XSS
 const escapeHtml = str => String(str || '')
@@ -233,47 +237,56 @@ const send = (chatId, text) => tg('sendMessage', {
 });
 
 // ==================== DATA FETCHING ====================
-async function fetchTrades(limit = 100, days = null) {
-  for (const src of SOURCES) {
-    try {
-      log(`Trying ${src.name}...`);
-      const res = await fetch(src.url, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(15000)
-      });
-      if (!res.ok) {
-        log(`${src.name}: HTTP ${res.status}`);
-        continue;
-      }
-      
-      let trades = src.parse(await res.json());
-      
-      // Sort by date descending (newest first)
-      trades.sort((a, b) => new Date(b.date) - new Date(a.date));
-      
-      // Log newest trade date for debugging
-      if (trades.length > 0) {
-        log(`${src.name}: Newest trade: ${trades[0].date}, Oldest in batch: ${trades[Math.min(9, trades.length-1)].date}`);
-      }
-      
-      // Filter by days if specified
-      if (days) {
-        const cutoff = Date.now() - days * 86400000;
-        const beforeFilter = trades.length;
-        trades = trades.filter(t => {
-          const tradeDate = new Date(t.date);
-          return !isNaN(tradeDate) && tradeDate >= cutoff;
+async function fetchTrades(limit = 100, days = null, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    for (const src of SOURCES) {
+      try {
+        if (attempt > 0) log(`Retry ${attempt}/${retries}...`);
+        log(`Trying ${src.name}...`);
+        const res = await fetch(src.url, {
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(15000)
         });
-        log(`${src.name}: Filtered ${beforeFilter} → ${trades.length} trades (last ${days} days)`);
-      }
-      
-      // Return trades (could be empty if no trades in date range - that's valid)
-      log(`✅ ${src.name}: Returning ${Math.min(limit, trades.length)} trades`);
-      return { trades: trades.slice(0, limit), source: src.name, success: true };
-      
-    } catch (e) { log(`${src.name}: ${e.message}`); }
+        if (!res.ok) {
+          log(`${src.name}: HTTP ${res.status}`);
+          continue;
+        }
+        
+        let trades = src.parse(await res.json());
+        
+        // Sort by date descending (newest first)
+        trades.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
+        // Log newest trade date for debugging
+        if (trades.length > 0) {
+          log(`${src.name}: Newest trade: ${trades[0].date}, Oldest in batch: ${trades[Math.min(9, trades.length-1)].date}`);
+        }
+        
+        // Filter by days if specified
+        if (days) {
+          const cutoff = Date.now() - days * 86400000;
+          const beforeFilter = trades.length;
+          trades = trades.filter(t => {
+            const tradeDate = new Date(t.date);
+            return !isNaN(tradeDate) && tradeDate >= cutoff;
+          });
+          log(`${src.name}: Filtered ${beforeFilter} → ${trades.length} trades (last ${days} days)`);
+        }
+        
+        // Return trades (could be empty if no trades in date range - that's valid)
+        log(`✅ ${src.name}: Returning ${Math.min(limit, trades.length)} trades`);
+        return { trades: trades.slice(0, limit), source: src.name, success: true };
+        
+      } catch (e) { log(`${src.name}: ${e.message}`); }
+    }
+    
+    // Wait before retry
+    if (attempt < retries) {
+      log(`All sources failed, waiting 1s before retry...`);
+      await delay(1000);
+    }
   }
-  log('❌ All sources failed');
+  log('❌ All sources failed after retries');
   return { trades: [], source: null, success: false };
 }
 
