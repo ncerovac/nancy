@@ -1,0 +1,14 @@
+{
+  "name": "congress-trade-alerts",
+  "version": "1.0.0",
+  "description": "Get Telegram alerts when members of Congress trade stocks",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["congress", "stocks", "trading", "alerts", "telegram"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
