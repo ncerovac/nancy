@@ -2,7 +2,7 @@
 
 Real-time Telegram alerts when U.S. Congress members trade stocks.
 
-![Version](https://img.shields.io/badge/version-3.1.0-blue)
+![Version](https://img.shields.io/badge/version-3.3.0-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-green)
 ![License](https://img.shields.io/badge/license-MIT-gray)
 ![Security](https://img.shields.io/badge/security-hardened-brightgreen)
@@ -22,6 +22,8 @@ Congress members must disclose stock trades within 45 days under the STOCK Act. 
 - 🔍 **Search** — Find trades by politician or ticker (clickable!)
 - 📊 **Analytics** — Buy/sell ratios, top traders, trends
 - 📈 **Chart links** — One-tap to Yahoo Finance
+- 🔄 **Auto-retry** — Handles flaky APIs automatically
+- 💾 **Persistent storage** — Subscribers survive restarts
 - 🔒 **Security hardened** — XSS protection, rate limiting, input validation
 
 ---
@@ -36,13 +38,14 @@ Congress members must disclose stock trades within 45 days under the STOCK Act. 
 | `/today` | Last 24 hours |
 | `/week` | Last 7 days |
 | `/month` | Last 30 days + stats |
-| `/politicians` | Browse all active traders (clickable) |
+| `/politicians` | Browse active traders (clickable) |
 | `/politicians_all` | View complete list |
-| `/tickers` | Browse all traded stocks (clickable) |
+| `/tickers` | Browse traded stocks (clickable) |
 | `/tickers_all` | View complete list |
 | `/search [query]` | Search by name/ticker |
 | `/top` | Most active traders |
 | `/stats` | Market statistics |
+| `/status` | Bot health & uptime |
 | `/help` | Full command guide |
 
 ---
@@ -77,19 +80,31 @@ Ticker links directly to Yahoo Finance chart.
 2. Go to [railway.app](https://railway.app)
 3. **New Project** → **Deploy from GitHub**
 4. Select your fork
-5. Add variable: `TELEGRAM_BOT_TOKEN=your_token`
-6. Deploy
+5. Add variables (see below)
+6. **Add Volume** for persistent storage:
+   - Mount path: `/app/data`
+7. Deploy
 
-### 3. Share
+---
 
-Send your bot's username to friends. They just press Start!
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Yes | Bot token from @BotFather |
+| `DATA_DIR` | No | Path for persistent storage (set to `/app/data` with Railway volume) |
+| `ADMIN_ID` | No | Your Telegram user ID for admin commands |
+
+**Admin commands** (only work for ADMIN_ID):
+- `/debug` — View recent logs
+- `/subs` — List all subscribers
 
 ---
 
 ## Self-Hosting
 
 ```bash
-git clone https://github.com/yourusername/nancy.git
+git clone https://github.com/ncerovac/nancy.git
 cd nancy
 export TELEGRAM_BOT_TOKEN="your_token"
 npm start
@@ -116,7 +131,7 @@ Add the bot to any group:
 
 ## Data Sources
 
-Pulls from multiple sources with automatic fallback:
+Pulls from multiple sources with automatic fallback and retry:
 1. Quiver Quant
 2. House Stock Watcher
 3. Senate Stock Watcher
@@ -147,14 +162,6 @@ This bot is security-hardened for public deployment:
 - **APIs:** Telegram Bot API, public trade APIs
 - **Hosting:** Railway, Render, or any Node host
 - **Dependencies:** None (zero npm packages!)
-
----
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | Bot token from @BotFather |
 
 ---
 
