@@ -137,9 +137,8 @@ const parseValue = str => str?.match(/\$?([\d,]+)/)?.[1]?.replace(/,/g, '') * 1 
 const isGroup = id => id < 0;
 const delay = ms => new Promise(r => setTimeout(r, ms));
 const log = (...args) => {
-  console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
-  // Force flush for Railway logs
-  if (process.stdout.write) process.stdout.write('');
+  const msg = `[${new Date().toISOString().slice(11, 19)}] ${args.join(' ')}`;
+  process.stdout.write(msg + '\n');
 };
 
 // Sanitize HTML to prevent XSS
