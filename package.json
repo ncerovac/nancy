@@ -1,13 +1,29 @@
 {
   "name": "congress-trade-bot",
-  "version": "3.0.0",
-  "description": "Telegram bot for Congressional stock trade alerts",
+  "version": "3.1.0",
+  "description": "Telegram bot for Congressional stock trade alerts - security hardened",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "keywords": [
+    "congress",
+    "stocks",
+    "trading",
+    "telegram",
+    "bot",
+    "alerts",
+    "politics",
+    "finance"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ncerovac/nancy"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
-  "license": "MIT"
+  "private": false
 }
