@@ -136,10 +136,7 @@ const SOURCES = [
 const parseValue = str => str?.match(/\$?([\d,]+)/)?.[1]?.replace(/,/g, '') * 1 || null;
 const isGroup = id => id < 0;
 const delay = ms => new Promise(r => setTimeout(r, ms));
-const log = (...args) => {
-  const msg = `[${new Date().toISOString().slice(11, 19)}] ${args.join(' ')}`;
-  process.stdout.write(msg + '\n');
-};
+const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
 
 // Sanitize HTML to prevent XSS
 const escapeHtml = str => String(str || '')
