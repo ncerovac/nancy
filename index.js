@@ -151,8 +151,10 @@ const sanitizeQuery = str => String(str || '')
   .slice(0, 100); // Limit length
 
 function load() {
+  log(`📁 Data file path: ${CONFIG.dataFile}`);
   try {
     if (fs.existsSync(CONFIG.dataFile)) {
+      log(`📁 File exists, reading...`);
       const raw = fs.readFileSync(CONFIG.dataFile, 'utf8');
       const data = JSON.parse(raw);
       
@@ -169,12 +171,15 @@ function load() {
       
       log(`📂 Loaded ${state.subscribers.length} subscribers from file`);
     } else {
+      log(`📁 File does not exist`);
       // No file - try loading from env var backup
       const envSubs = loadSubscribersFromEnv();
       if (envSubs.length > 0) {
         state.subscribers = envSubs;
         log(`📂 Loaded ${state.subscribers.length} subscribers from SUBSCRIBERS env var`);
         save(); // Save to file for this session
+      } else {
+        log(`📂 No subscribers found, starting fresh`);
       }
     }
   } catch (e) { 
@@ -793,6 +798,7 @@ async function main() {
     process.exit(1);
   }
   
+  log(`📁 DATA_DIR env: ${process.env.DATA_DIR || 'not set'}`);
   load();
   await tg('deleteWebhook', { drop_pending_updates: true });
   
