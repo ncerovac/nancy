@@ -9,6 +9,7 @@ const CONFIG = {
   dataFile: process.env.DATA_DIR 
     ? path.join(process.env.DATA_DIR, 'data.json')
     : path.join(__dirname, 'data.json'),
+  adminId: process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null,
 };
 
 // ==================== STATE ====================
@@ -16,6 +17,10 @@ let state = { subscribers: [], seen: [], lastCheck: null };
 let botInfo = null;
 let lastUpdateId = 0;
 let polling = false;
+
+// Debug log buffer (last 50 entries)
+const debugLog = [];
+const MAX_DEBUG_LOG = 50;
 
 // Load subscribers from env var as backup (persists across deploys without volume)
 function loadSubscribersFromEnv() {
@@ -136,7 +141,13 @@ const SOURCES = [
 const parseValue = str => str?.match(/\$?([\d,]+)/)?.[1]?.replace(/,/g, '') * 1 || null;
 const isGroup = id => id < 0;
 const delay = ms => new Promise(r => setTimeout(r, ms));
-const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
+const log = (...args) => {
+  const msg = `[${new Date().toISOString().slice(11, 19)}] ${args.join(' ')}`;
+  console.log(msg);
+  // Store in debug buffer
+  debugLog.push(msg);
+  if (debugLog.length > MAX_DEBUG_LOG) debugLog.shift();
+};
 
 // Sanitize HTML to prevent XSS
 const escapeHtml = str => String(str || '')
@@ -713,7 +724,32 @@ ${group ? '\n<b>👥 GROUP</b>\nAlerts go to all members.' : ''}`);
 
 ━━━━━━━━━━━━━━━━━━━━━
 💡 Bot checks for new trades every hour and alerts all subscribers automatically.`);
-  }
+  },
+
+  // Admin-only debug command
+  async debug(chatId, _, userId) {
+    // Only allow admin
+    if (!CONFIG.adminId || userId !== CONFIG.adminId) {
+      return; // Silently ignore for non-admins
+    }
+    
+    if (debugLog.length === 0) {
+      return send(chatId, '📋 <b>Debug Log</b>\n\nNo logs yet.');
+    }
+    
+    const logs = debugLog.slice(-30).join('\n');
+    await send(chatId, `📋 <b>Debug Log</b> (last ${Math.min(30, debugLog.length)} entries)\n\n<code>${escapeHtml(logs)}</code>`);
+  },
+
+  // Admin-only: list all subscribers
+  async subs(chatId, _, userId) {
+    if (!CONFIG.adminId || userId !== CONFIG.adminId) {
+      return;
+    }
+    
+    const subs = state.subscribers.map(id => `• ${id}`).join('\n') || 'None';
+    await send(chatId, `👥 <b>Subscribers</b> (${state.subscribers.length})\n\n${subs}`);
+  },
 };
 
 // ==================== POLLING ====================
@@ -763,7 +799,8 @@ async function processUpdate(u) {
     
     // Handle commands with underscores (politicians_all, tickers_all)
     if (COMMANDS[command]) {
-      await COMMANDS[command](chatId, args.join(' ') || { username: msg.from?.username, title: msg.chat.title });
+      const userId = msg.from?.id;
+      await COMMANDS[command](chatId, args.join(' ') || { username: msg.from?.username, title: msg.chat.title }, userId);
     } else if (cmd.startsWith('/') && msg.chat.type === 'private') {
       await send(chatId, '❓ Unknown command. Try /help');
     }
