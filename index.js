@@ -565,12 +565,54 @@ Alerts sent hourly when new trades found.
 <b>📈 ANALYSIS</b>
 /stats — Buy/sell ratios, trends
 
+<b>⚙️ SYSTEM</b>
+/status — Bot health & last check time
+
 <b>💡 TIPS</b>
 • Disclosures delayed up to 45 days
 • Large trades ($1M+) most significant
 • Watch activity before major votes
 
 ${group ? '\n<b>👥 GROUP</b>\nAlerts go to all members.' : ''}`);
+  },
+
+  async status(chatId) {
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const mins = Math.floor((uptime % 3600) / 60);
+    const secs = Math.floor(uptime % 60);
+    
+    const lastCheck = state.lastCheck 
+      ? new Date(state.lastCheck).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
+      : 'Never';
+    
+    const nextCheck = state.lastCheck
+      ? new Date(new Date(state.lastCheck).getTime() + CONFIG.checkInterval).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
+      : 'Soon';
+    
+    const isSubscribed = state.subscribers.includes(chatId);
+    
+    await send(chatId, `⚙️ <b>Bot Status</b>
+
+<b>🤖 System</b>
+• Status: 🟢 Online
+• Uptime: ${hours}h ${mins}m ${secs}s
+• Version: 3.1.0
+
+<b>⏰ Auto-Alerts</b>
+• Check interval: 60 minutes
+• Last check: ${lastCheck}
+• Next check: ~${nextCheck}
+
+<b>📊 Data</b>
+• Subscribers: ${state.subscribers.length}
+• Tracked trades: ${state.seen.length}
+
+<b>👤 Your Status</b>
+• Subscribed: ${isSubscribed ? '✅ Yes' : '❌ No'}
+
+━━━━━━━━━━━━━━━━━━━━━
+💡 Bot checks for new trades every hour and alerts all subscribers automatically.`);
   }
 };
 
@@ -678,6 +720,7 @@ async function main() {
       { command: 'search', description: '🔍 Search' },
       { command: 'top', description: '🏆 Top traders' },
       { command: 'stats', description: '📊 Statistics' },
+      { command: 'status', description: '⚙️ Bot health' },
       { command: 'help', description: '❓ Help' },
     ]
   });
