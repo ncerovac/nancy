@@ -8,8 +8,75 @@ const CONFIG = {
   dataFile: path.join(__dirname, 'bot_data.json'),
 };
 
-// Data source
-const API_URL = 'https://bff.capitoltrades.com/trades';
+// Data sources (multiple fallbacks)
+const DATA_SOURCES = [
+  {
+    name: 'Quiver Quant',
+    url: 'https://api.quiverquant.com/beta/live/congresstrading',
+    transform: (data) => data.map(t => ({
+      politician: { 
+        name: t.Representative, 
+        party: t.Party === 'D' ? 'Democrat' : t.Party === 'R' ? 'Republican' : t.Party,
+        state: t.District?.substring(0, 2) || '',
+        chamber: t.House === 'Representatives' ? 'house' : 'senate'
+      },
+      asset: { 
+        assetTicker: t.Ticker, 
+        assetName: t.Description || t.Ticker 
+      },
+      txType: t.Transaction,
+      txDate: t.TransactionDate,
+      value: t.Range ? parseRange(t.Range) : null,
+      _id: `${t.Representative}-${t.Ticker}-${t.TransactionDate}-${t.Transaction}`
+    }))
+  },
+  {
+    name: 'House Stock Watcher',
+    url: 'https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json',
+    transform: (data) => data.slice(0, 200).map(t => ({
+      politician: {
+        name: t.representative,
+        party: t.party || '',
+        state: t.state || t.district || '',
+        chamber: 'house'
+      },
+      asset: {
+        assetTicker: t.ticker,
+        assetName: t.asset_description || ''
+      },
+      txType: t.type || t.transaction_type,
+      txDate: t.transaction_date,
+      value: t.amount,
+      _id: `${t.representative}-${t.ticker}-${t.transaction_date}-${t.type}`
+    }))
+  },
+  {
+    name: 'Senate Stock Watcher', 
+    url: 'https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json',
+    transform: (data) => data.slice(0, 200).map(t => ({
+      politician: {
+        name: t.senator,
+        party: t.party || '',
+        state: t.state || '',
+        chamber: 'senate'
+      },
+      asset: {
+        assetTicker: t.ticker,
+        assetName: t.asset_description || ''
+      },
+      txType: t.type || t.transaction_type,
+      txDate: t.transaction_date,
+      value: t.amount,
+      _id: `${t.senator}-${t.ticker}-${t.transaction_date}-${t.type}`
+    }))
+  }
+];
+
+function parseRange(range) {
+  if (!range) return null;
+  const match = range.match(/\$?([\d,]+)/);
+  return match ? parseInt(match[1].replace(/,/g, '')) : null;
+}
 
 // In-memory storage (persisted to file)
 let botData = {
@@ -118,36 +185,49 @@ async function setCommands() {
   });
 }
 
-// ==================== CAPITOL TRADES API ====================
-
-async function fetchTrades(pageSize = 100, days = null) {
-  try {
-    let url = `${API_URL}?pageSize=${pageSize}`;
-    
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; CongressTradeBot/2.0)',
-        'Accept': 'application/json',
+// Fetch trades with fallback sources
+async function fetchTrades(limit = 100, days = null) {
+  for (const source of DATA_SOURCES) {
+    try {
+      console.log(`Trying ${source.name}...`);
+      
+      const response = await fetch(source.url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(10000) // 10 second timeout
+      });
+      
+      if (!response.ok) {
+        console.log(`${source.name} returned HTTP ${response.status}`);
+        continue;
       }
-    });
-    
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    
-    const data = await response.json();
-    let trades = data.data || [];
-    
-    // Filter by days if specified
-    if (days) {
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - days);
-      trades = trades.filter(t => new Date(t.txDate) >= cutoff);
+      
+      const rawData = await response.json();
+      let trades = source.transform(rawData);
+      
+      // Filter by days if specified
+      if (days) {
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - days);
+        trades = trades.filter(t => {
+          const tradeDate = new Date(t.txDate);
+          return tradeDate >= cutoff;
+        });
+      }
+      
+      console.log(`✅ ${source.name}: fetched ${trades.length} trades`);
+      return trades.slice(0, limit);
+      
+    } catch (err) {
+      console.log(`${source.name} error: ${err.message}`);
+      continue;
     }
-    
-    return trades;
-  } catch (err) {
-    console.error('Error fetching trades:', err.message);
-    return [];
   }
+  
+  console.log('❌ All data sources failed');
+  return [];
 }
 
 async function searchTrades(query, limit = 10) {
@@ -702,18 +782,48 @@ ${isGroupChat ? '\n<b>👥 GROUP MODE</b>\nThis bot works in groups! Alerts go t
 // ==================== POLLING FOR UPDATES ====================
 
 let lastUpdateId = 0;
+let isPolling = false;
+
+async function clearWebhookAndGetUpdates() {
+  // Delete any existing webhook to prevent conflicts
+  await telegramRequest('deleteWebhook', { drop_pending_updates: true });
+  console.log('✅ Cleared any existing webhooks');
+}
 
 async function pollUpdates() {
+  if (isPolling) return; // Prevent concurrent polls
+  isPolling = true;
+  
   try {
     const result = await telegramRequest('getUpdates', {
       offset: lastUpdateId + 1,
       timeout: 30,
+      allowed_updates: ['message']
     });
     
-    if (!result || !result.result) return;
+    if (!result || !result.result) {
+      isPolling = false;
+      return;
+    }
     
     for (const update of result.result) {
       lastUpdateId = update.update_id;
+      await processUpdate(update);
+    }
+  } catch (err) {
+    if (err.message?.includes('Conflict')) {
+      console.log('⚠️ Polling conflict detected, clearing...');
+      await clearWebhookAndGetUpdates();
+    } else {
+      console.error('Polling error:', err.message);
+    }
+  }
+  
+  isPolling = false;
+}
+
+async function processUpdate(update) {
+  try {
       
       if (update.message?.text) {
         const chatId = update.message.chat.id;
@@ -782,8 +892,8 @@ async function pollUpdates() {
       
       // Handle when bot is added to a group
       if (update.message?.new_chat_members) {
-        const botInfo = await getBotInfo();
-        const wasAdded = update.message.new_chat_members.some(m => m.id === botInfo?.id);
+        const botInfoData = await getBotInfo();
+        const wasAdded = update.message.new_chat_members.some(m => m.id === botInfoData?.id);
         if (wasAdded) {
           const chatId = update.message.chat.id;
           const chatTitle = update.message.chat.title;
@@ -791,9 +901,8 @@ async function pollUpdates() {
           await handleStart(chatId, 'group', chatTitle);
         }
       }
-    }
   } catch (err) {
-    console.error('Polling error:', err.message);
+    console.error('Error processing update:', err.message);
   }
 }
 
@@ -814,7 +923,7 @@ async function getBotUsername() {
 // ==================== AUTO ALERTS ====================
 
 function getTradeId(trade) {
-  return `${trade.politician?.name || ''}-${trade.asset?.assetTicker || ''}-${trade.txDate}-${trade.value}`;
+  return trade._id || `${trade.politician?.name || ''}-${trade.asset?.assetTicker || ''}-${trade.txDate}-${trade.value}`;
 }
 
 async function checkAndAlertNewTrades() {
@@ -823,9 +932,11 @@ async function checkAndAlertNewTrades() {
   const trades = await fetchTrades(50);
   
   if (trades.length === 0) {
-    console.log('No trades fetched.');
+    console.log('No trades fetched from any source.');
     return;
   }
+  
+  console.log(`Processing ${trades.length} trades...`);
   
   const newTrades = [];
   
@@ -874,19 +985,22 @@ async function main() {
   // Load persisted data
   loadData();
   
+  // Clear any existing webhooks to prevent conflicts
+  await clearWebhookAndGetUpdates();
+  
   // Set bot commands menu
   await setCommands();
   console.log('✅ Bot commands registered');
   
   // Get bot info
-  const botInfo = await telegramRequest('getMe');
-  if (botInfo?.result) {
-    console.log(`✅ Bot: @${botInfo.result.username}`);
+  const botInfoResult = await telegramRequest('getMe');
+  if (botInfoResult?.result) {
+    console.log(`✅ Bot: @${botInfoResult.result.username}`);
   }
   
-  // Start polling for messages
+  // Start polling for messages (with longer interval to avoid conflicts)
   console.log('✅ Listening for messages...');
-  setInterval(pollUpdates, 1000);
+  setInterval(pollUpdates, 2000); // Poll every 2 seconds instead of 1
   
   // Start auto-alerts
   console.log('✅ Auto-alerts scheduled (every 60 minutes)');
@@ -899,6 +1013,12 @@ async function main() {
   
   // Keep alive
   process.on('SIGTERM', () => {
+    console.log('Shutting down gracefully...');
+    saveData();
+    process.exit(0);
+  });
+  
+  process.on('SIGINT', () => {
     console.log('Shutting down...');
     saveData();
     process.exit(0);
