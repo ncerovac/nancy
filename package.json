@@ -1,6 +1,6 @@
 {
   "name": "congress-trade-bot",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "Telegram bot for Congressional stock trade alerts - security hardened",
   "main": "index.js",
   "scripts": {
