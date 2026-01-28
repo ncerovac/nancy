@@ -1,15 +1,21 @@
+/**
+ * Congressional Trade Bot v3.3.0
+ * Telegram bot for tracking U.S. Congress stock trades
+ */
+
 const fs = require('fs');
 const path = require('path');
 
 // ==================== CONFIG ====================
 const CONFIG = {
   token: process.env.TELEGRAM_BOT_TOKEN,
-  checkInterval: 60 * 60 * 1000,
-  // Use /app/data for Railway volume persistence, fallback to local
+  adminId: process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null,
   dataFile: process.env.DATA_DIR 
     ? path.join(process.env.DATA_DIR, 'data.json')
     : path.join(__dirname, 'data.json'),
-  adminId: process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null,
+  checkInterval: 60 * 60 * 1000,
+  retries: 2,
+  timeout: 15000,
 };
 
 // ==================== STATE ====================
@@ -17,26 +23,11 @@ let state = { subscribers: [], seen: [], lastCheck: null };
 let botInfo = null;
 let lastUpdateId = 0;
 let polling = false;
-
-// Debug log buffer (last 50 entries)
 const debugLog = [];
-const MAX_DEBUG_LOG = 50;
+const rateLimits = new Map();
 
-// Load subscribers from env var as backup (persists across deploys without volume)
-function loadSubscribersFromEnv() {
-  if (process.env.SUBSCRIBERS) {
-    try {
-      const ids = JSON.parse(process.env.SUBSCRIBERS);
-      if (Array.isArray(ids)) return ids.filter(id => typeof id === 'number');
-    } catch (e) { /* ignore */ }
-  }
-  return [];
-}
-
-// ==================== DATA SOURCES ====================
-
-// Common ticker to company name lookup (for when API doesn't provide it)
-const TICKER_NAMES = {
+// ==================== TICKER LOOKUP ====================
+const TICKERS = {
   AAPL: 'Apple Inc', MSFT: 'Microsoft Corp', GOOGL: 'Alphabet Inc', GOOG: 'Alphabet Inc',
   AMZN: 'Amazon.com Inc', META: 'Meta Platforms', NVDA: 'NVIDIA Corp', TSLA: 'Tesla Inc',
   AMD: 'Advanced Micro Devices', INTC: 'Intel Corp', CRM: 'Salesforce Inc', ORCL: 'Oracle Corp',
@@ -51,7 +42,7 @@ const TICKER_NAMES = {
   ABBV: 'AbbVie Inc', LLY: 'Eli Lilly', BMY: 'Bristol-Myers Squibb', AMGN: 'Amgen Inc',
   XOM: 'Exxon Mobil', CVX: 'Chevron Corp', COP: 'ConocoPhillips', SLB: 'Schlumberger',
   WMT: 'Walmart Inc', COST: 'Costco Wholesale', TGT: 'Target Corp', HD: 'Home Depot',
-  LOW: 'Lowe\'s Companies', MCD: 'McDonald\'s Corp', SBUX: 'Starbucks Corp', NKE: 'Nike Inc',
+  LOW: "Lowe's Companies", MCD: "McDonald's Corp", SBUX: 'Starbucks Corp', NKE: 'Nike Inc',
   KO: 'Coca-Cola Co', PEP: 'PepsiCo Inc', PM: 'Philip Morris', MO: 'Altria Group',
   PG: 'Procter & Gamble', CL: 'Colgate-Palmolive', KMB: 'Kimberly-Clark', EL: 'Estée Lauder',
   BA: 'Boeing Co', LMT: 'Lockheed Martin', RTX: 'Raytheon Technologies', GD: 'General Dynamics',
@@ -69,686 +60,438 @@ const TICKER_NAMES = {
   VTI: 'Vanguard Total Stock', VOO: 'Vanguard S&P 500', BND: 'Vanguard Total Bond', GLD: 'SPDR Gold Shares',
 };
 
-const getCompanyName = (ticker, description) => {
-  if (description && description !== ticker && description.length > 2) return description;
-  return TICKER_NAMES[ticker] || '';
-};
-
-const SOURCES = [
-  {
-    name: 'Quiver Quant',
-    url: 'https://api.quiverquant.com/beta/live/congresstrading',
-    parse: data => data.map(t => ({
-      id: `${t.Representative}-${t.Ticker}-${t.TransactionDate}`,
-      name: t.Representative,
-      party: t.Party === 'D' ? 'Democrat' : t.Party === 'R' ? 'Republican' : t.Party,
-      state: t.District?.slice(0, 2) || '',
-      chamber: t.House === 'Representatives' ? 'house' : 'senate',
-      ticker: t.Ticker,
-      company: getCompanyName(t.Ticker, t.Description),
-      type: t.Transaction,
-      date: t.TransactionDate,
-      value: parseValue(t.Range),
-    }))
-  },
-  {
-    name: 'House Stock Watcher',
-    url: 'https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json',
-    parse: data => {
-      // Sort by date FIRST, then take recent ones
-      const sorted = data
-        .map(t => ({
-          id: `${t.representative}-${t.ticker}-${t.transaction_date}`,
-          name: t.representative,
-          party: t.party || '',
-          state: t.state || t.district || '',
-          chamber: 'house',
-          ticker: t.ticker,
-          company: getCompanyName(t.ticker, t.asset_description),
-          type: t.type || t.transaction_type,
-          date: t.transaction_date,
-          value: t.amount,
-        }))
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
-      return sorted.slice(0, 500);
-    }
-  },
-  {
-    name: 'Senate Stock Watcher',
-    url: 'https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json',
-    parse: data => {
-      // Sort by date FIRST, then take recent ones
-      const sorted = data
-        .map(t => ({
-          id: `${t.senator}-${t.ticker}-${t.transaction_date}`,
-          name: t.senator,
-          party: t.party || '',
-          state: t.state || '',
-          chamber: 'senate',
-          ticker: t.ticker,
-          company: getCompanyName(t.ticker, t.asset_description),
-          type: t.type || t.transaction_type,
-          date: t.transaction_date,
-          value: t.amount,
-        }))
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
-      return sorted.slice(0, 500);
-    }
-  }
-];
-
 // ==================== HELPERS ====================
-const parseValue = str => str?.match(/\$?([\d,]+)/)?.[1]?.replace(/,/g, '') * 1 || null;
-const isGroup = id => id < 0;
-const delay = ms => new Promise(r => setTimeout(r, ms));
-const log = (...args) => {
-  const msg = `[${new Date().toISOString().slice(11, 19)}] ${args.join(' ')}`;
-  console.log(msg);
-  // Store in debug buffer
-  debugLog.push(msg);
-  if (debugLog.length > MAX_DEBUG_LOG) debugLog.shift();
+const log = (...a) => {
+  const m = `[${new Date().toISOString().slice(11,19)}] ${a.join(' ')}`;
+  console.log(m);
+  debugLog.push(m);
+  if (debugLog.length > 50) debugLog.shift();
 };
+const delay = ms => new Promise(r => setTimeout(r, ms));
+const isGroup = id => id < 0;
+const parseValue = s => s?.match(/\$?([\d,]+)/)?.[1]?.replace(/,/g, '') * 1 || null;
+const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const clean = s => String(s||'').replace(/[<>"'&]/g,'').slice(0,100);
+const company = (t,d) => (d && d !== t && d.length > 2) ? d : (TICKERS[t] || '');
 
-// Sanitize HTML to prevent XSS
-const escapeHtml = str => String(str || '')
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;');
+function rateLimit(id) {
+  const now = Date.now();
+  if (now - (rateLimits.get(id)||0) < 1000) return true;
+  rateLimits.set(id, now);
+  if (rateLimits.size > 10000) {
+    for (const [k,v] of rateLimits) if (now - v > 60000) rateLimits.delete(k);
+  }
+  return false;
+}
 
-// Sanitize for URL params
-const sanitizeQuery = str => String(str || '')
-  .replace(/[<>\"\'&]/g, '')
-  .slice(0, 100); // Limit length
-
+// ==================== PERSISTENCE ====================
 function load() {
-  log(`📁 Data file path: ${CONFIG.dataFile}`);
+  log(`📁 Data: ${CONFIG.dataFile}`);
   try {
     if (fs.existsSync(CONFIG.dataFile)) {
-      log(`📁 File exists, reading...`);
-      const raw = fs.readFileSync(CONFIG.dataFile, 'utf8');
-      const data = JSON.parse(raw);
-      
-      // Validate loaded data structure
+      const d = JSON.parse(fs.readFileSync(CONFIG.dataFile, 'utf8'));
       state = {
-        subscribers: Array.isArray(data.subscribers) 
-          ? data.subscribers.filter(id => typeof id === 'number') 
-          : [],
-        seen: Array.isArray(data.seen) 
-          ? data.seen.filter(id => typeof id === 'string').slice(-2000)
-          : [],
-        lastCheck: typeof data.lastCheck === 'string' ? data.lastCheck : null
+        subscribers: (d.subscribers||[]).filter(i => typeof i === 'number'),
+        seen: (d.seen||[]).filter(i => typeof i === 'string').slice(-2000),
+        lastCheck: typeof d.lastCheck === 'string' ? d.lastCheck : null
       };
-      
-      log(`📂 Loaded ${state.subscribers.length} subscribers from file`);
-    } else {
-      log(`📁 File does not exist`);
-      // No file - try loading from env var backup
-      const envSubs = loadSubscribersFromEnv();
-      if (envSubs.length > 0) {
-        state.subscribers = envSubs;
-        log(`📂 Loaded ${state.subscribers.length} subscribers from SUBSCRIBERS env var`);
-        save(); // Save to file for this session
-      } else {
-        log(`📂 No subscribers found, starting fresh`);
-      }
+      log(`📂 Loaded ${state.subscribers.length} subs`);
+    } else if (process.env.SUBSCRIBERS) {
+      try {
+        const ids = JSON.parse(process.env.SUBSCRIBERS);
+        if (Array.isArray(ids)) {
+          state.subscribers = ids.filter(i => typeof i === 'number');
+          log(`📂 From env: ${state.subscribers.length}`);
+          save();
+        }
+      } catch {}
     }
-  } catch (e) { 
-    log('Load error:', e.message);
-    // Try env var backup
-    const envSubs = loadSubscribersFromEnv();
-    if (envSubs.length > 0) {
-      state.subscribers = envSubs;
-      log(`📂 Recovered ${state.subscribers.length} subscribers from SUBSCRIBERS env var`);
-    }
-    state.seen = [];
-    state.lastCheck = null;
-  }
+  } catch (e) { log('Load err:', e.message); }
 }
 
 function save() {
   try {
     state.seen = state.seen.slice(-2000);
-    const data = JSON.stringify(state);
-    // Write to temp file first, then rename (atomic write)
-    const tempFile = CONFIG.dataFile + '.tmp';
-    fs.writeFileSync(tempFile, data);
-    fs.renameSync(tempFile, CONFIG.dataFile);
-  } catch (e) {
-    log('Save error:', e.message);
-  }
+    const tmp = CONFIG.dataFile + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.renameSync(tmp, CONFIG.dataFile);
+  } catch (e) { log('Save err:', e.message); }
 }
+
+// ==================== DATA SOURCES ====================
+const SOURCES = [
+  {
+    name: 'Quiver',
+    url: 'https://api.quiverquant.com/beta/live/congresstrading',
+    parse: d => d.map(t => ({
+      id: `${t.Representative}-${t.Ticker}-${t.TransactionDate}`,
+      name: t.Representative, ticker: t.Ticker, date: t.TransactionDate,
+      party: t.Party==='D'?'Democrat':t.Party==='R'?'Republican':t.Party,
+      state: t.District?.slice(0,2)||'',
+      chamber: t.House==='Representatives'?'house':'senate',
+      company: company(t.Ticker, t.Description),
+      type: t.Transaction, value: parseValue(t.Range),
+    }))
+  },
+  {
+    name: 'House',
+    url: 'https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json',
+    parse: d => d.map(t => ({
+      id: `${t.representative}-${t.ticker}-${t.transaction_date}`,
+      name: t.representative, ticker: t.ticker, date: t.transaction_date,
+      party: t.party||'', state: t.state||t.district||'', chamber: 'house',
+      company: company(t.ticker, t.asset_description),
+      type: t.type||t.transaction_type, value: t.amount,
+    })).sort((a,b) => new Date(b.date)-new Date(a.date)).slice(0,500)
+  },
+  {
+    name: 'Senate',
+    url: 'https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json',
+    parse: d => d.map(t => ({
+      id: `${t.senator}-${t.ticker}-${t.transaction_date}`,
+      name: t.senator, ticker: t.ticker, date: t.transaction_date,
+      party: t.party||'', state: t.state||'', chamber: 'senate',
+      company: company(t.ticker, t.asset_description),
+      type: t.type||t.transaction_type, value: t.amount,
+    })).sort((a,b) => new Date(b.date)-new Date(a.date)).slice(0,500)
+  }
+];
 
 // ==================== TELEGRAM ====================
 async function tg(method, params = {}) {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${CONFIG.token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
+    const r = await fetch(`https://api.telegram.org/bot${CONFIG.token}/${method}`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(params)
     });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.description);
-    return data;
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.description);
+    return d;
   } catch (e) {
     if (!e.message?.includes('Conflict')) log(`TG ${method}:`, e.message);
     return null;
   }
 }
+const send = (id, txt) => tg('sendMessage', {chat_id:id, text:txt, parse_mode:'HTML', disable_web_page_preview:true});
 
-const send = (chatId, text) => tg('sendMessage', { 
-  chat_id: chatId, 
-  text, 
-  parse_mode: 'HTML', 
-  disable_web_page_preview: true 
-});
-
-// ==================== DATA FETCHING ====================
-async function fetchTrades(limit = 100, days = null, retries = 2) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
+// ==================== FETCH TRADES ====================
+async function fetchTrades(limit = 100, days = null) {
+  for (let i = 0; i <= CONFIG.retries; i++) {
+    if (i > 0) { log(`Retry ${i}...`); await delay(1000); }
+    
     for (const src of SOURCES) {
       try {
-        if (attempt > 0) log(`Retry ${attempt}/${retries}...`);
         log(`Trying ${src.name}...`);
-        const res = await fetch(src.url, {
-          headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(15000)
+        const r = await fetch(src.url, {
+          headers: {'User-Agent':'Mozilla/5.0','Accept':'application/json'},
+          signal: AbortSignal.timeout(CONFIG.timeout)
         });
-        if (!res.ok) {
-          log(`${src.name}: HTTP ${res.status}`);
-          continue;
-        }
+        if (!r.ok) { log(`${src.name}: ${r.status}`); continue; }
         
-        let trades = src.parse(await res.json());
+        let trades = src.parse(await r.json());
+        trades.sort((a,b) => new Date(b.date)-new Date(a.date));
         
-        // Sort by date descending (newest first)
-        trades.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Log newest trade date for debugging
-        if (trades.length > 0) {
-          log(`${src.name}: Newest trade: ${trades[0].date}, Oldest in batch: ${trades[Math.min(9, trades.length-1)].date}`);
-        }
-        
-        // Filter by days if specified
         if (days) {
-          const cutoff = Date.now() - days * 86400000;
-          const beforeFilter = trades.length;
-          trades = trades.filter(t => {
-            const tradeDate = new Date(t.date);
-            return !isNaN(tradeDate) && tradeDate >= cutoff;
-          });
-          log(`${src.name}: Filtered ${beforeFilter} → ${trades.length} trades (last ${days} days)`);
+          const cut = Date.now() - days * 86400000;
+          trades = trades.filter(t => { const d=new Date(t.date); return !isNaN(d) && d >= cut; });
         }
         
-        // Return trades (could be empty if no trades in date range - that's valid)
-        log(`✅ ${src.name}: Returning ${Math.min(limit, trades.length)} trades`);
-        return { trades: trades.slice(0, limit), source: src.name, success: true };
-        
+        log(`✅ ${src.name}: ${trades.length}`);
+        return { trades: trades.slice(0, limit), ok: true };
       } catch (e) { log(`${src.name}: ${e.message}`); }
     }
-    
-    // Wait before retry
-    if (attempt < retries) {
-      log(`All sources failed, waiting 1s before retry...`);
-      await delay(1000);
-    }
   }
-  log('❌ All sources failed after retries');
-  return { trades: [], source: null, success: false };
-}
-
-// Helper to handle fetch results
-async function getTrades(limit = 100, days = null) {
-  const result = await fetchTrades(limit, days);
-  return result;
+  log('❌ All failed');
+  return { trades: [], ok: false };
 }
 
 // ==================== FORMATTING ====================
 function fmt(t, i = 0) {
-  const type = (t.type || '').toLowerCase();
-  const emoji = /buy|purchase/.test(type) ? '🟢' : /sell|sale/.test(type) ? '🔴' : '⚪';
-  const party = t.party === 'Democrat' ? 'Dem' : t.party === 'Republican' ? 'Rep' : escapeHtml(t.party);
-  const loc = [party, escapeHtml(t.state)].filter(Boolean).join(', ');
-  const chamber = t.chamber === 'senate' ? '🏛️' : '🏠';
-  const value = t.value ? `$${Number(t.value).toLocaleString()}` : 'N/A';
-  const name = escapeHtml(t.name) || 'Unknown';
-  const date = escapeHtml(t.date) || 'N/A';
+  const type = (t.type||'').toLowerCase();
+  const emoji = /buy|purchase/.test(type)?'🟢':/sell|sale/.test(type)?'🔴':'⚪';
+  const party = t.party==='Democrat'?'Dem':t.party==='Republican'?'Rep':esc(t.party);
+  const loc = [party, esc(t.state)].filter(Boolean).join(', ');
+  const chamber = t.chamber==='senate'?'🏛️':'🏠';
+  const val = t.value ? `$${Number(t.value).toLocaleString()}` : 'N/A';
   
-  // Consistent: TICKER (linked to chart) + full company name
-  let assetLine = '';
-  const ticker = sanitizeQuery(t.ticker);
-  const company = escapeHtml(t.company);
-  
+  const ticker = clean(t.ticker);
+  const comp = esc(t.company);
+  let asset = comp || 'Unknown';
   if (ticker && ticker !== 'N/A') {
-    const tickerLink = `<a href="https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}">${escapeHtml(ticker)}</a>`;
-    assetLine = company && company !== ticker 
-      ? `${tickerLink} — ${company}`
-      : tickerLink;
-  } else {
-    assetLine = company || 'Unknown';
+    const link = `<a href="https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}">${esc(ticker)}</a>`;
+    asset = comp && comp !== ticker ? `${link} — ${comp}` : link;
   }
   
-  return `${i ? `<b>${i}.</b> ` : ''}${emoji} <b>${assetLine}</b>
-   📋 ${escapeHtml((type || 'trade').toUpperCase())}
-   👤 ${name} ${loc ? `(${loc})` : ''} ${chamber}
-   💰 ${value} | 📅 ${date}`;
+  return `${i?`<b>${i}.</b> `:''}${emoji} <b>${asset}</b>
+   📋 ${esc((type||'trade').toUpperCase())}
+   👤 ${esc(t.name)} ${loc?`(${loc})`:''} ${chamber}
+   💰 ${val} | 📅 ${esc(t.date)}`;
 }
 
-function fmtCompact(t) {
-  const type = (t.type || '').slice(0, 4).toUpperCase();
-  const emoji = /BUY|PURC/.test(type) ? '🟢' : '🔴';
-  const ticker = escapeHtml(t.ticker) || '???';
-  const company = t.company && t.company !== t.ticker ? ` (${escapeHtml(t.company).slice(0, 20)})` : '';
-  const name = escapeHtml(t.name);
-  return `${emoji} <b>${ticker}</b>${company} | ${name} | ${escapeHtml(type)}`;
-}
+const fmtShort = t => {
+  const type = (t.type||'').slice(0,4).toUpperCase();
+  return `${/BUY|PURC/.test(type)?'🟢':'🔴'} <b>${esc(t.ticker)}</b> | ${esc(t.name)} | ${esc(type)}`;
+};
 
 // ==================== COMMANDS ====================
-// Simple rate limiting
-const rateLimits = new Map();
-const RATE_LIMIT_MS = 1000; // 1 second between commands per user
-
-function isRateLimited(chatId) {
-  const now = Date.now();
-  const last = rateLimits.get(chatId) || 0;
-  if (now - last < RATE_LIMIT_MS) return true;
-  rateLimits.set(chatId, now);
-  // Clean old entries periodically
-  if (rateLimits.size > 10000) {
-    for (const [id, time] of rateLimits) {
-      if (now - time > 60000) rateLimits.delete(id);
-    }
-  }
-  return false;
-}
-
-const COMMANDS = {
-  async start(chatId, arg) {
-    // Handle deep link search (from clicking politician name)
-    // Silently route to search without showing /start was triggered
+const CMD = {
+  async start(cid, arg) {
     if (typeof arg === 'string' && arg.startsWith('search_')) {
-      const query = sanitizeQuery(decodeURIComponent(arg.replace('search_', '')));
-      if (query) return COMMANDS.search(chatId, query);
+      const q = clean(decodeURIComponent(arg.replace('search_', '')));
+      if (q) return CMD.search(cid, q);
     }
-    
-    const { username, title } = typeof arg === 'object' ? arg : { username: 'user', title: null };
-    
-    if (!state.subscribers.includes(chatId)) {
-      state.subscribers.push(chatId);
+    const {username,title} = typeof arg === 'object' ? arg : {username:'user',title:null};
+    if (!state.subscribers.includes(cid)) {
+      state.subscribers.push(cid);
       save();
-      log(`✅ New: ${chatId} ${title ? `(${escapeHtml(title)})` : `@${escapeHtml(username)}`}`);
+      log(`✅ New: ${cid} ${title?`(${esc(title)})`:`@${esc(username)}`}`);
     }
-    const group = isGroup(chatId);
-    await send(chatId, `🏛️ <b>Congressional Trade Alerts</b>
+    const g = isGroup(cid);
+    await send(cid, `🏛️ <b>Congressional Trade Alerts</b>
 
-${group ? '📢 <b>Group alerts enabled!</b>\n\n' : ''}Track stock trades by U.S. Congress members in real-time.
+${g?'📢 <b>Group alerts enabled!</b>\n\n':''}Track stock trades by U.S. Congress members.
 
 <b>📌 WHY IT MATTERS</b>
-Congress must disclose trades within 45 days. Studies show they often outperform the market.
+Congress must disclose trades within 45 days.
 
 <b>📊 COMMANDS</b>
 /latest • /today • /week • /month
 /politicians • /tickers • /search
 /top • /stats • /help
 
-${group ? '━━━━━━━━━━━━━━━━━━━━━\n💡 All members will receive alerts.' : '━━━━━━━━━━━━━━━━━━━━━\n💡 Try /politicians to see who\'s trading!'}`);
+${g?'━━━━━━━━━━━━━━━━━━━━━\n💡 All members will receive alerts.':'━━━━━━━━━━━━━━━━━━━━━\n💡 Try /politicians to browse!'}`);
   },
 
-  async stop(chatId) {
-    state.subscribers = state.subscribers.filter(id => id !== chatId);
+  async stop(cid) {
+    state.subscribers = state.subscribers.filter(i => i !== cid);
     save();
-    await send(chatId, `🛑 <b>Unsubscribed</b>\n\nUse /start to resubscribe.`);
+    await send(cid, '🛑 <b>Unsubscribed</b>\n\nUse /start to resubscribe.');
   },
 
-  async latest(chatId) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(10);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades found.');
-    await send(chatId, `📊 <b>Latest Trades</b>\n\n${result.trades.map((t, i) => fmt(t, i + 1)).join('\n\n')}`);
+  async latest(cid) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(10);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades found.');
+    await send(cid, `📊 <b>Latest Trades</b>\n\n${trades.map((t,i)=>fmt(t,i+1)).join('\n\n')}`);
   },
 
-  async today(chatId) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(100, 1);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 24 hours.');
-    const trades = result.trades;
-    await send(chatId, `📅 <b>Last 24 Hours</b> (${trades.length})\n\n${trades.slice(0, 15).map((t, i) => fmt(t, i + 1)).join('\n\n')}${trades.length > 15 ? `\n\n<i>+${trades.length - 15} more</i>` : ''}`);
+  async today(cid) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(100, 1);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 24h.');
+    await send(cid, `📅 <b>Last 24h</b> (${trades.length})\n\n${trades.slice(0,15).map((t,i)=>fmt(t,i+1)).join('\n\n')}${trades.length>15?`\n\n<i>+${trades.length-15} more</i>`:''}`);
   },
 
-  async week(chatId) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(200, 7);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 7 days.');
+  async week(cid) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(200, 7);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 7 days.');
     
-    const trades = result.trades;
-    const byDay = trades.reduce((acc, t) => {
-      const day = t.date?.slice(0, 10) || 'Unknown';
-      (acc[day] = acc[day] || []).push(t);
-      return acc;
-    }, {});
-    
-    let msg = `📆 <b>Last 7 Days</b> (${trades.length} trades)\n\n`;
-    Object.keys(byDay).sort().reverse().slice(0, 7).forEach(day => {
-      msg += `<b>📅 ${day}</b> (${byDay[day].length})\n`;
-      byDay[day].slice(0, 5).forEach(t => msg += `  ${fmtCompact(t)}\n`);
-      if (byDay[day].length > 5) msg += `  <i>+${byDay[day].length - 5} more</i>\n`;
+    const byDay = trades.reduce((a,t) => { const d=t.date?.slice(0,10)||'?'; (a[d]=a[d]||[]).push(t); return a; }, {});
+    let msg = `📆 <b>Last 7 Days</b> (${trades.length})\n\n`;
+    Object.keys(byDay).sort().reverse().slice(0,7).forEach(d => {
+      msg += `<b>📅 ${d}</b> (${byDay[d].length})\n`;
+      byDay[d].slice(0,5).forEach(t => msg += `  ${fmtShort(t)}\n`);
+      if (byDay[d].length > 5) msg += `  <i>+${byDay[d].length-5} more</i>\n`;
       msg += '\n';
     });
-    await send(chatId, msg);
+    await send(cid, msg);
   },
 
-  async month(chatId) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(500, 30);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
+  async month(cid) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(500, 30);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 30 days.');
     
-    const trades = result.trades;
     const buys = trades.filter(t => /buy|purchase/i.test(t.type)).length;
     const sells = trades.length - buys;
-    const tickers = Object.entries(trades.reduce((a, t) => (a[t.ticker] = (a[t.ticker] || 0) + 1, a), {}))
-      .sort((a, b) => b[1] - a[1]).slice(0, 5);
+    const top = Object.entries(trades.reduce((a,t)=>(a[t.ticker]=(a[t.ticker]||0)+1,a),{}))
+      .sort((a,b)=>b[1]-a[1]).slice(0,5);
     
-    await send(chatId, `🗓️ <b>Last 30 Days</b>
+    await send(cid, `🗓️ <b>Last 30 Days</b>
 
 📊 ${trades.length} trades | 🟢 ${buys} buys | 🔴 ${sells} sells
-📈 Ratio: ${(buys / (sells || 1)).toFixed(2)}
+📈 Ratio: ${(buys/(sells||1)).toFixed(2)}
 
 <b>Top Tickers:</b>
-${tickers.map(([t, c], i) => `${i + 1}. <b>${escapeHtml(t)}</b> — ${c}`).join('\n')}
+${top.map(([t,c],i)=>`${i+1}. <b>${esc(t)}</b> — ${c}`).join('\n')}
 
-<b>Recent:</b>\n\n${trades.slice(0, 8).map((t, i) => fmt(t, i + 1)).join('\n\n')}`);
+<b>Recent:</b>\n\n${trades.slice(0,8).map((t,i)=>fmt(t,i+1)).join('\n\n')}`);
   },
 
-  async top(chatId) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(500, 30);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
+  async top(cid) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(500, 30);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 30 days.');
     
-    const trades = result.trades;
-    const traders = trades.reduce((a, t) => {
-      a[t.name] = a[t.name] || { count: 0, party: t.party };
-      a[t.name].count++;
-      return a;
-    }, {});
+    const traders = trades.reduce((a,t) => { a[t.name]=a[t.name]||{c:0,p:t.party}; a[t.name].c++; return a; }, {});
+    const top = Object.entries(traders).sort((a,b)=>b[1].c-a[1].c).slice(0,10);
+    const medals = ['🥇','🥈','🥉'];
     
-    const top = Object.entries(traders).sort((a, b) => b[1].count - a[1].count).slice(0, 10);
-    const medals = ['🥇', '🥈', '🥉'];
-    
-    await send(chatId, `🏆 <b>Most Active (30 Days)</b>\n\n${top.map(([name, { count, party }], i) => 
-      `${medals[i] || `${i + 1}.`} <b>${escapeHtml(name)}</b> (${party === 'Democrat' ? 'Dem' : party === 'Republican' ? 'Rep' : escapeHtml(party)})\n   ${count} trades`
-    ).join('\n\n')}\n\n💡 Use /search [name] to see their trades`);
+    await send(cid, `🏆 <b>Most Active (30d)</b>\n\n${top.map(([n,{c,p}],i)=>
+      `${medals[i]||`${i+1}.`} <b>${esc(n)}</b> (${p==='Democrat'?'Dem':p==='Republican'?'Rep':esc(p)})\n   ${c} trades`
+    ).join('\n\n')}\n\n💡 /search [name] for details`);
   },
 
-  async politicians(chatId, arg) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(500, 90);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 90 days.');
+  async politicians(cid, arg) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(500, 90);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 90 days.');
     
-    const trades = result.trades;
-    const pols = trades.reduce((a, t) => {
-      a[t.name] = a[t.name] || { party: t.party, state: t.state, count: 0 };
-      a[t.name].count++;
-      return a;
-    }, {});
+    const pols = trades.reduce((a,t) => { a[t.name]=a[t.name]||{p:t.party,s:t.state,c:0}; a[t.name].c++; return a; }, {});
+    const sorted = Object.entries(pols).sort((a,b)=>b[1].c-a[1].c);
+    const dems = sorted.filter(([,p])=>p.p==='Democrat');
+    const reps = sorted.filter(([,p])=>p.p==='Republican');
     
-    const sorted = Object.entries(pols).sort((a, b) => b[1].count - a[1].count);
-    const dems = sorted.filter(([, p]) => p.party === 'Democrat');
-    const reps = sorted.filter(([, p]) => p.party === 'Republican');
-    
-    // Check if user wants full list
-    const showAll = arg === 'all' || arg === 'full';
-    const limit = showAll ? 50 : 10;
-    
-    const formatPol = ([name, p]) => {
-      const safeName = escapeHtml(name);
-      const searchName = sanitizeQuery(name.split(' ').pop()); // Use last name for search
-      const safeState = escapeHtml(p.state);
-      return `• <a href="https://t.me/${botInfo?.username}?start=search_${encodeURIComponent(searchName)}">${safeName}</a>${safeState ? ` (${safeState})` : ''} — ${p.count}`;
+    const all = arg === 'all';
+    const lim = all ? 50 : 10;
+    const fmt = ([n,p]) => {
+      const ln = clean(n.split(' ').pop());
+      return `• <a href="https://t.me/${botInfo?.username}?start=search_${encodeURIComponent(ln)}">${esc(n)}</a>${p.s?` (${esc(p.s)})`:''} — ${p.c}`;
     };
     
-    const demList = dems.slice(0, limit).map(formatPol).join('\n');
-    const repList = reps.slice(0, limit).map(formatPol).join('\n');
-    
-    const demMore = dems.length > limit ? `\n<i>+${dems.length - limit} more</i>` : '';
-    const repMore = reps.length > limit ? `\n<i>+${reps.length - limit} more</i>` : '';
-    
-    const viewAllBtn = !showAll && (dems.length > limit || reps.length > limit) 
-      ? `\n━━━━━━━━━━━━━━━━━━━━━\n📋 /politicians_all — View complete list` 
-      : '';
-    
-    await send(chatId, `👥 <b>Active Politicians (90 Days)</b>
+    await send(cid, `👥 <b>Politicians (90d)</b>
 
 🔵 <b>Democrats (${dems.length})</b>
-${demList}${demMore}
+${dems.slice(0,lim).map(fmt).join('\n')}${dems.length>lim?`\n<i>+${dems.length-lim}</i>`:''}
 
 🔴 <b>Republicans (${reps.length})</b>
-${repList}${repMore}
-${viewAllBtn}
+${reps.slice(0,lim).map(fmt).join('\n')}${reps.length>lim?`\n<i>+${reps.length-lim}</i>`:''}
+${!all&&(dems.length>lim||reps.length>lim)?'\n━━━━━━━━━━━━━━━━━━━━━\n📋 /politicians_all — View all':''}
 
-💡 Tap a name to see their trades`);
+💡 Tap name to see trades`);
   },
 
-  async politicians_all(chatId) {
-    return COMMANDS.politicians(chatId, 'all');
-  },
+  politicians_all(cid) { return CMD.politicians(cid, 'all'); },
 
-  async tickers(chatId, arg) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(500, 30);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
+  async tickers(cid, arg) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(500, 30);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 30 days.');
     
-    const trades = result.trades;
-    const tickers = trades.reduce((a, t) => {
-      if (!t.ticker || t.ticker === 'N/A') return a;
-      a[t.ticker] = a[t.ticker] || { company: t.company, buys: 0, sells: 0 };
-      /buy|purchase/i.test(t.type) ? a[t.ticker].buys++ : a[t.ticker].sells++;
+    const tix = trades.reduce((a,t) => {
+      if (!t.ticker||t.ticker==='N/A') return a;
+      a[t.ticker]=a[t.ticker]||{co:t.company,b:0,s:0};
+      /buy|purchase/i.test(t.type)?a[t.ticker].b++:a[t.ticker].s++;
       return a;
     }, {});
     
-    const sorted = Object.entries(tickers)
-      .map(([t, d]) => ({ t, ...d, total: d.buys + d.sells }))
-      .sort((a, b) => b.total - a.total);
+    const sorted = Object.entries(tix).map(([t,d])=>({t,...d,n:d.b+d.s})).sort((a,b)=>b.n-a.n);
+    const all = arg === 'all';
+    const lim = all ? 40 : 15;
     
-    const showAll = arg === 'all' || arg === 'full';
-    const limit = showAll ? 40 : 15;
-    const display = sorted.slice(0, limit);
-    
-    const msg = display.map((s, i) => {
-      const trend = s.buys > s.sells ? '🟢' : s.sells > s.buys ? '🔴' : '⚪';
-      const safeTicker = escapeHtml(s.t);
-      const safeCompany = escapeHtml(s.company)?.slice(0, 28) || '';
-      const tickerLink = `<a href="https://t.me/${botInfo?.username}?start=search_${encodeURIComponent(sanitizeQuery(s.t))}">${safeTicker}</a>`;
-      const chartLink = `<a href="https://finance.yahoo.com/quote/${encodeURIComponent(s.t)}">📈</a>`;
-      return `<b>${i + 1}. ${tickerLink}</b> ${chartLink} ${trend}\n   ${safeCompany}\n   ${s.total} trades (${s.buys}↑ ${s.sells}↓)`;
+    const msg = sorted.slice(0,lim).map((s,i) => {
+      const trend = s.b>s.s?'🟢':s.s>s.b?'🔴':'⚪';
+      const tl = `<a href="https://t.me/${botInfo?.username}?start=search_${encodeURIComponent(clean(s.t))}">${esc(s.t)}</a>`;
+      const cl = `<a href="https://finance.yahoo.com/quote/${encodeURIComponent(s.t)}">📈</a>`;
+      return `<b>${i+1}. ${tl}</b> ${cl} ${trend}\n   ${esc(s.co)?.slice(0,28)||''}\n   ${s.n} (${s.b}↑ ${s.s}↓)`;
     }).join('\n\n');
     
-    const viewAllBtn = !showAll && sorted.length > limit 
-      ? `\n━━━━━━━━━━━━━━━━━━━━━\n📋 /tickers_all — View all ${sorted.length} stocks` 
-      : '';
-    
-    await send(chatId, `📈 <b>Top Stocks (30 Days)</b>\n\n${msg}${viewAllBtn}\n\n💡 Tap ticker to see trades, 📈 for chart`);
+    await send(cid, `📈 <b>Stocks (30d)</b>\n\n${msg}${!all&&sorted.length>lim?`\n━━━━━━━━━━━━━━━━━━━━━\n📋 /tickers_all — All ${sorted.length}`:''}\n\n💡 Tap ticker → trades, 📈 → chart`);
   },
 
-  async tickers_all(chatId) {
-    return COMMANDS.tickers(chatId, 'all');
+  tickers_all(cid) { return CMD.tickers(cid, 'all'); },
+
+  async search(cid, q) {
+    if (!q || q.length < 2) return send(cid, `🔍 <b>Search</b>\n\n/search [name or ticker]\n\n<b>Examples:</b>\n• /search Pelosi\n• /search NVDA`);
+    
+    const sq = clean(q).slice(0,50);
+    if (!sq) return send(cid, '❌ Invalid query.');
+    
+    await send(cid, `🔍 Searching "${esc(sq)}"...`);
+    const {trades, ok} = await fetchTrades(500);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    
+    const ql = sq.toLowerCase();
+    const res = trades.filter(t => t.name?.toLowerCase().includes(ql) || t.ticker?.toLowerCase().includes(ql) || t.company?.toLowerCase().includes(ql)).slice(0,10);
+    
+    if (!res.length) return send(cid, `📭 No results for "${esc(sq)}"`);
+    await send(cid, `🔍 <b>"${esc(sq)}"</b>\n\n${res.map((t,i)=>fmt(t,i+1)).join('\n\n')}`);
   },
 
-  async search(chatId, query) {
-    if (!query || query.length < 2) {
-      return send(chatId, `🔍 <b>Search Trades</b>
-
-/search [name or ticker]
-
-<b>Examples:</b>
-• /search Pelosi
-• /search NVDA
-• /search Tesla
-
-💡 Use /politicians or /tickers to browse`);
-    }
-    
-    // Sanitize and limit query
-    const safeQuery = sanitizeQuery(query).slice(0, 50);
-    if (!safeQuery) return send(chatId, '❌ Invalid search query.');
-    
-    await send(chatId, `🔍 Searching "${escapeHtml(safeQuery)}"...`);
-    const result = await fetchTrades(500);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    
-    const q = safeQuery.toLowerCase();
-    const results = result.trades.filter(t => 
-      t.name?.toLowerCase().includes(q) || 
-      t.ticker?.toLowerCase().includes(q) || 
-      t.company?.toLowerCase().includes(q)
-    ).slice(0, 10);
-    
-    if (!results.length) return send(chatId, `📭 No results for "${escapeHtml(safeQuery)}"`);
-    await send(chatId, `🔍 <b>Results: "${escapeHtml(safeQuery)}"</b>\n\n${results.map((t, i) => fmt(t, i + 1)).join('\n\n')}`);
-  },
-
-  async stats(chatId) {
-    await send(chatId, '⏳ Loading...');
-    const result = await fetchTrades(500, 30);
-    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
-    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
-    
-    const trades = result.trades;
+  async stats(cid) {
+    await send(cid, '⏳ Loading...');
+    const {trades, ok} = await fetchTrades(500, 30);
+    if (!ok) return send(cid, '⚠️ <b>Data Unavailable</b>\n\nTry again in a few minutes.');
+    if (!trades.length) return send(cid, '📭 No trades in last 30 days.');
     
     const buys = trades.filter(t => /buy|purchase/i.test(t.type)).length;
     const sells = trades.length - buys;
-    const dems = trades.filter(t => t.party === 'Democrat').length;
-    const reps = trades.filter(t => t.party === 'Republican').length;
-    const tech = ['AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'META', 'NVDA', 'AMD', 'INTC'];
-    const techCount = trades.filter(t => tech.includes(t.ticker)).length;
-    const ratio = (buys / (sells || 1)).toFixed(2);
-    const sentiment = ratio > 1.2 ? '📈 Bullish' : ratio < 0.8 ? '📉 Bearish' : '➡️ Neutral';
-    const value = trades.reduce((a, t) => a + (Number(t.value) || 0), 0);
+    const dems = trades.filter(t => t.party==='Democrat').length;
+    const reps = trades.filter(t => t.party==='Republican').length;
+    const tech = ['AAPL','MSFT','GOOGL','GOOG','AMZN','META','NVDA','AMD','INTC'];
+    const techN = trades.filter(t => tech.includes(t.ticker)).length;
+    const ratio = (buys/(sells||1)).toFixed(2);
+    const sent = ratio>1.2?'📈 Bullish':ratio<0.8?'📉 Bearish':'➡️ Neutral';
+    const val = trades.reduce((a,t)=>a+(Number(t.value)||0),0);
     
-    await send(chatId, `📊 <b>Trading Statistics (30 Days)</b>
+    await send(cid, `📊 <b>Stats (30d)</b>
 
 <b>Activity</b>
-• Trades: ${trades.length}
-• Est. Value: $${(value / 1e6).toFixed(1)}M+
-• Politicians: ${new Set(trades.map(t => t.name)).size}
+• ${trades.length} trades • $${(val/1e6).toFixed(1)}M+
+• ${new Set(trades.map(t=>t.name)).size} politicians
 
 <b>Sentiment</b>
-• 🟢 Buys: ${buys} | 🔴 Sells: ${sells}
-• Ratio: ${ratio} ${sentiment}
+• 🟢 ${buys} buys | 🔴 ${sells} sells
+• Ratio: ${ratio} ${sent}
 
 <b>Party</b>
 • 🔵 Dem: ${dems} | 🔴 Rep: ${reps}
 
-<b>Sectors</b>
-• Tech: ${techCount} (${((techCount / trades.length) * 100).toFixed(0)}%)
-
-━━━━━━━━━━━━━━━━━━━━━
-💡 Congressional portfolios historically beat the S&P 500`);
+<b>Tech</b>
+• ${techN} trades (${((techN/trades.length)*100).toFixed(0)}%)`);
   },
 
-  async help(chatId) {
-    const group = isGroup(chatId);
-    await send(chatId, `📖 <b>Help Guide</b>
+  async help(cid) {
+    await send(cid, `📖 <b>Help</b>
 
 <b>🔔 ALERTS</b>
 /start — Subscribe
 /stop — Unsubscribe
-Alerts sent hourly when new trades found.
 
-<b>📊 VIEW TRADES</b>
-/latest — Last 10 trades
-/today — Last 24 hours
-/week — Last 7 days
-/month — Last 30 days + stats
+<b>📊 TRADES</b>
+/latest • /today • /week • /month
 
 <b>🔍 RESEARCH</b>
-/politicians — Browse active traders
-/tickers — Browse traded stocks
-/search [query] — Find trades
-/top — Most active traders
+/politicians • /tickers • /search • /top
 
 <b>📈 ANALYSIS</b>
-/stats — Buy/sell ratios, trends
+/stats — Buy/sell ratios
 
 <b>⚙️ SYSTEM</b>
-/status — Bot health & last check time
-
-<b>💡 TIPS</b>
-• Disclosures delayed up to 45 days
-• Large trades ($1M+) most significant
-• Watch activity before major votes
-
-${group ? '\n<b>👥 GROUP</b>\nAlerts go to all members.' : ''}`);
+/status — Bot health`);
   },
 
-  async status(chatId) {
-    const uptime = process.uptime();
-    const hours = Math.floor(uptime / 3600);
-    const mins = Math.floor((uptime % 3600) / 60);
-    const secs = Math.floor(uptime % 60);
+  async status(cid) {
+    const up = process.uptime();
+    const h = Math.floor(up/3600), m = Math.floor((up%3600)/60), s = Math.floor(up%60);
+    const lc = state.lastCheck ? new Date(state.lastCheck).toLocaleString('en-US',{timeZone:'UTC'})+' UTC' : 'Never';
     
-    const lastCheck = state.lastCheck 
-      ? new Date(state.lastCheck).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
-      : 'Never';
-    
-    const nextCheck = state.lastCheck
-      ? new Date(new Date(state.lastCheck).getTime() + CONFIG.checkInterval).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
-      : 'Soon';
-    
-    const isSubscribed = state.subscribers.includes(chatId);
-    
-    await send(chatId, `⚙️ <b>Bot Status</b>
+    await send(cid, `⚙️ <b>Status</b>
 
-<b>🤖 System</b>
-• Status: 🟢 Online
-• Uptime: ${hours}h ${mins}m ${secs}s
-• Version: 3.2.0
-
-<b>⏰ Auto-Alerts</b>
-• Check interval: 60 minutes
-• Last check: ${lastCheck}
-• Next check: ~${nextCheck}
-
-<b>📊 Data</b>
+• Online: 🟢 ${h}h ${m}m ${s}s
+• Version: 3.3.0
+• Last check: ${lc}
 • Subscribers: ${state.subscribers.length}
-• Tracked trades: ${state.seen.length}
-
-<b>👤 Your Status</b>
-• Subscribed: ${isSubscribed ? '✅ Yes' : '❌ No'}
-
-━━━━━━━━━━━━━━━━━━━━━
-💡 Bot checks for new trades every hour and alerts all subscribers automatically.`);
+• Tracked: ${state.seen.length}
+• You: ${state.subscribers.includes(cid)?'✅':'❌'}`);
   },
 
-  // Admin-only debug command
-  async debug(chatId, _, userId) {
-    // Only allow admin
-    if (!CONFIG.adminId || userId !== CONFIG.adminId) {
-      return; // Silently ignore for non-admins
-    }
-    
-    if (debugLog.length === 0) {
-      return send(chatId, '📋 <b>Debug Log</b>\n\nNo logs yet.');
-    }
-    
-    const logs = debugLog.slice(-30).join('\n');
-    await send(chatId, `📋 <b>Debug Log</b> (last ${Math.min(30, debugLog.length)} entries)\n\n<code>${escapeHtml(logs)}</code>`);
+  // Admin
+  async debug(cid, _, uid) {
+    if (!CONFIG.adminId || uid !== CONFIG.adminId) return;
+    await send(cid, `📋 <b>Debug</b>\n\n<code>${esc(debugLog.slice(-30).join('\n'))}</code>`);
   },
 
-  // Admin-only: list all subscribers
-  async subs(chatId, _, userId) {
-    if (!CONFIG.adminId || userId !== CONFIG.adminId) {
-      return;
-    }
-    
-    const subs = state.subscribers.map(id => `• ${id}`).join('\n') || 'None';
-    await send(chatId, `👥 <b>Subscribers</b> (${state.subscribers.length})\n\n${subs}`);
+  async subs(cid, _, uid) {
+    if (!CONFIG.adminId || uid !== CONFIG.adminId) return;
+    await send(cid, `👥 <b>Subs</b> (${state.subscribers.length})\n\n${state.subscribers.join('\n')||'None'}`);
   },
 };
 
@@ -756,17 +499,15 @@ ${group ? '\n<b>👥 GROUP</b>\nAlerts go to all members.' : ''}`);
 async function poll() {
   if (polling) return;
   polling = true;
-  
   try {
-    const res = await tg('getUpdates', { offset: lastUpdateId + 1, timeout: 30, allowed_updates: ['message'] });
-    for (const u of res?.result || []) {
+    const r = await tg('getUpdates', {offset: lastUpdateId+1, timeout: 30, allowed_updates: ['message']});
+    for (const u of r?.result || []) {
       lastUpdateId = u.update_id;
       await processUpdate(u);
     }
   } catch (e) {
-    if (e.message?.includes('Conflict')) await tg('deleteWebhook', { drop_pending_updates: true });
+    if (e.message?.includes('Conflict')) await tg('deleteWebhook', {drop_pending_updates: true});
   }
-  
   polling = false;
 }
 
@@ -775,61 +516,50 @@ async function processUpdate(u) {
     const msg = u.message;
     if (!msg) return;
     
-    const chatId = msg.chat?.id;
-    if (!chatId || typeof chatId !== 'number') return; // Validate chatId
+    const cid = msg.chat?.id;
+    if (!cid || typeof cid !== 'number') return;
     
-    // Bot added to group
     if (msg.new_chat_members?.some(m => m.id === botInfo?.id)) {
-      log(`🎉 Added to: ${escapeHtml(msg.chat.title)}`);
-      return COMMANDS.start(chatId, { title: msg.chat.title });
+      log(`🎉 Added: ${esc(msg.chat.title)}`);
+      return CMD.start(cid, {title: msg.chat.title});
     }
     
     if (!msg.text || typeof msg.text !== 'string') return;
+    if (rateLimit(cid)) return;
     
-    // Rate limiting
-    if (isRateLimited(chatId)) return;
+    const [cmd, ...args] = msg.text.slice(0,200).split(' ');
+    const c = cmd.toLowerCase().split('@')[0].slice(1);
     
-    const [cmd, ...args] = msg.text.slice(0, 200).split(' '); // Limit input length
-    const command = cmd.toLowerCase().split('@')[0].slice(1);
+    if (!/^[a-z0-9_]+$/.test(c)) return;
     
-    // Validate command name (alphanumeric and underscore only)
-    if (!/^[a-z0-9_]+$/.test(command)) return;
+    log(`📨 ${esc(msg.chat.title||'@'+msg.from?.username)}: /${c}`);
     
-    log(`📨 ${escapeHtml(msg.chat.title || '@' + msg.from?.username)}: /${command}`);
-    
-    // Handle commands with underscores (politicians_all, tickers_all)
-    if (COMMANDS[command]) {
-      const userId = msg.from?.id;
-      await COMMANDS[command](chatId, args.join(' ') || { username: msg.from?.username, title: msg.chat.title }, userId);
+    if (CMD[c]) {
+      await CMD[c](cid, args.join(' ')||{username:msg.from?.username,title:msg.chat.title}, msg.from?.id);
     } else if (cmd.startsWith('/') && msg.chat.type === 'private') {
-      await send(chatId, '❓ Unknown command. Try /help');
+      await send(cid, '❓ Unknown. Try /help');
     }
-  } catch (e) { log('Update error:', e.message); }
+  } catch (e) { log('Err:', e.message); }
 }
 
-// ==================== AUTO ALERTS ====================
+// ==================== ALERTS ====================
 async function checkAlerts() {
-  log('Checking for new trades...');
-  const result = await fetchTrades(50);
-  if (!result.success) return log('⚠️ Could not fetch trades - all sources failed.');
-  if (!result.trades.length) return log('No new trades in dataset.');
+  log('Checking...');
+  const {trades, ok} = await fetchTrades(50);
+  if (!ok) return log('⚠️ Fetch failed');
+  if (!trades.length) return log('No data');
   
-  const newTrades = result.trades.filter(t => !state.seen.includes(t.id));
-  newTrades.forEach(t => state.seen.push(t.id));
+  const newT = trades.filter(t => !state.seen.includes(t.id));
+  newT.forEach(t => state.seen.push(t.id));
   
-  if (newTrades.length && state.subscribers.length) {
-    log(`📢 Alerting ${state.subscribers.length} subs about ${newTrades.length} trades`);
-    for (const t of newTrades.slice(0, 5)) {
-      const msg = `🚨 <b>New Trade</b>\n\n${fmt(t)}`;
-      for (const id of state.subscribers) {
-        await send(id, msg);
-        await delay(50);
-      }
+  if (newT.length && state.subscribers.length) {
+    log(`📢 ${newT.length} new → ${state.subscribers.length} subs`);
+    for (const t of newT.slice(0,5)) {
+      const m = `🚨 <b>New Trade</b>\n\n${fmt(t)}`;
+      for (const id of state.subscribers) { await send(id, m); await delay(50); }
       await delay(300);
     }
-  } else if (newTrades.length === 0) {
-    log('No new trades since last check.');
-  }
+  } else log('No new');
   
   state.lastCheck = new Date().toISOString();
   save();
@@ -837,45 +567,31 @@ async function checkAlerts() {
 
 // ==================== MAIN ====================
 async function main() {
-  console.log('\n🏛️ Congressional Trade Bot v3.2\n');
+  console.log('\n🏛️ Congressional Trade Bot v3.3.0\n');
   
-  if (!CONFIG.token) {
-    console.error('❌ TELEGRAM_BOT_TOKEN required');
-    process.exit(1);
-  }
+  if (!CONFIG.token) { console.error('❌ TELEGRAM_BOT_TOKEN required'); process.exit(1); }
   
-  log(`📁 DATA_DIR env: ${process.env.DATA_DIR || 'not set'}`);
   load();
-  await tg('deleteWebhook', { drop_pending_updates: true });
-  
-  await tg('setMyCommands', {
-    commands: [
-      { command: 'start', description: '🚀 Subscribe' },
-      { command: 'stop', description: '🛑 Unsubscribe' },
-      { command: 'latest', description: '📊 Latest trades' },
-      { command: 'today', description: '📅 Last 24h' },
-      { command: 'week', description: '📆 Last 7 days' },
-      { command: 'month', description: '🗓️ Last 30 days' },
-      { command: 'politicians', description: '👥 Politicians' },
-      { command: 'tickers', description: '📈 Stocks' },
-      { command: 'search', description: '🔍 Search' },
-      { command: 'top', description: '🏆 Top traders' },
-      { command: 'stats', description: '📊 Statistics' },
-      { command: 'status', description: '⚙️ Bot health' },
-      { command: 'help', description: '❓ Help' },
-    ]
-  });
+  await tg('deleteWebhook', {drop_pending_updates: true});
+  await tg('setMyCommands', {commands: [
+    {command:'start',description:'🚀 Subscribe'},{command:'stop',description:'🛑 Unsubscribe'},
+    {command:'latest',description:'📊 Latest'},{command:'today',description:'📅 24h'},
+    {command:'week',description:'📆 7 days'},{command:'month',description:'🗓️ 30 days'},
+    {command:'politicians',description:'👥 Politicians'},{command:'tickers',description:'📈 Stocks'},
+    {command:'search',description:'🔍 Search'},{command:'top',description:'🏆 Top traders'},
+    {command:'stats',description:'📊 Stats'},{command:'status',description:'⚙️ Status'},
+    {command:'help',description:'❓ Help'},
+  ]});
   
   const me = await tg('getMe');
   botInfo = me?.result;
   log(`✅ @${botInfo?.username}`);
   
-  setInterval(poll, 2000);
   await checkAlerts();
+  setInterval(poll, 2000);
   setInterval(checkAlerts, CONFIG.checkInterval);
   
-  log('🚀 Running!\n');
-  
+  log('🚀 Running!');
   process.on('SIGTERM', () => { save(); process.exit(0); });
   process.on('SIGINT', () => { save(); process.exit(0); });
 }
