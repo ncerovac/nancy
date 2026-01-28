@@ -5,7 +5,10 @@ const path = require('path');
 const CONFIG = {
   token: process.env.TELEGRAM_BOT_TOKEN,
   checkInterval: 60 * 60 * 1000,
-  dataFile: path.join(__dirname, 'data.json'),
+  // Use /app/data for Railway volume persistence, fallback to local
+  dataFile: process.env.DATA_DIR 
+    ? path.join(process.env.DATA_DIR, 'data.json')
+    : path.join(__dirname, 'data.json'),
 };
 
 // ==================== STATE ====================
@@ -13,6 +16,17 @@ let state = { subscribers: [], seen: [], lastCheck: null };
 let botInfo = null;
 let lastUpdateId = 0;
 let polling = false;
+
+// Load subscribers from env var as backup (persists across deploys without volume)
+function loadSubscribersFromEnv() {
+  if (process.env.SUBSCRIBERS) {
+    try {
+      const ids = JSON.parse(process.env.SUBSCRIBERS);
+      if (Array.isArray(ids)) return ids.filter(id => typeof id === 'number');
+    } catch (e) { /* ignore */ }
+  }
+  return [];
+}
 
 // ==================== DATA SOURCES ====================
 
@@ -153,12 +167,26 @@ function load() {
         lastCheck: typeof data.lastCheck === 'string' ? data.lastCheck : null
       };
       
-      log(`📂 Loaded ${state.subscribers.length} subscribers`);
+      log(`📂 Loaded ${state.subscribers.length} subscribers from file`);
+    } else {
+      // No file - try loading from env var backup
+      const envSubs = loadSubscribersFromEnv();
+      if (envSubs.length > 0) {
+        state.subscribers = envSubs;
+        log(`📂 Loaded ${state.subscribers.length} subscribers from SUBSCRIBERS env var`);
+        save(); // Save to file for this session
+      }
     }
   } catch (e) { 
     log('Load error:', e.message);
-    // Don't overwrite potentially corrupted file, start fresh in memory
-    state = { subscribers: [], seen: [], lastCheck: null };
+    // Try env var backup
+    const envSubs = loadSubscribersFromEnv();
+    if (envSubs.length > 0) {
+      state.subscribers = envSubs;
+      log(`📂 Recovered ${state.subscribers.length} subscribers from SUBSCRIBERS env var`);
+    }
+    state.seen = [];
+    state.lastCheck = null;
   }
 }
 
