@@ -234,17 +234,20 @@ async function fetchTrades(limit = 100, days = null) {
         log(`${src.name}: Filtered ${beforeFilter} → ${trades.length} trades (last ${days} days)`);
       }
       
-      if (trades.length > 0) {
-        log(`✅ ${src.name}: Returning ${Math.min(limit, trades.length)} trades`);
-        return trades.slice(0, limit);
-      } else {
-        log(`${src.name}: No trades match criteria, trying next source...`);
-        continue;
-      }
+      // Return trades (could be empty if no trades in date range - that's valid)
+      log(`✅ ${src.name}: Returning ${Math.min(limit, trades.length)} trades`);
+      return { trades: trades.slice(0, limit), source: src.name, success: true };
+      
     } catch (e) { log(`${src.name}: ${e.message}`); }
   }
-  log('❌ All sources failed or returned no data');
-  return [];
+  log('❌ All sources failed');
+  return { trades: [], source: null, success: false };
+}
+
+// Helper to handle fetch results
+async function getTrades(limit = 100, days = null) {
+  const result = await fetchTrades(limit, days);
+  return result;
 }
 
 // ==================== FORMATTING ====================
@@ -346,23 +349,28 @@ ${group ? '━━━━━━━━━━━━━━━━━━━━━\n💡
 
   async latest(chatId) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(10);
-    if (!trades.length) return send(chatId, '❌ Could not fetch trades.');
-    await send(chatId, `📊 <b>Latest Trades</b>\n\n${trades.map((t, i) => fmt(t, i + 1)).join('\n\n')}`);
+    const result = await fetchTrades(10);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades found.');
+    await send(chatId, `📊 <b>Latest Trades</b>\n\n${result.trades.map((t, i) => fmt(t, i + 1)).join('\n\n')}`);
   },
 
   async today(chatId) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(100, 1);
-    if (!trades.length) return send(chatId, '📭 No trades in last 24h.');
+    const result = await fetchTrades(100, 1);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 24 hours.');
+    const trades = result.trades;
     await send(chatId, `📅 <b>Last 24 Hours</b> (${trades.length})\n\n${trades.slice(0, 15).map((t, i) => fmt(t, i + 1)).join('\n\n')}${trades.length > 15 ? `\n\n<i>+${trades.length - 15} more</i>` : ''}`);
   },
 
   async week(chatId) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(200, 7);
-    if (!trades.length) return send(chatId, '📭 No trades in last 7 days.');
+    const result = await fetchTrades(200, 7);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 7 days.');
     
+    const trades = result.trades;
     const byDay = trades.reduce((acc, t) => {
       const day = t.date?.slice(0, 10) || 'Unknown';
       (acc[day] = acc[day] || []).push(t);
@@ -381,9 +389,11 @@ ${group ? '━━━━━━━━━━━━━━━━━━━━━\n💡
 
   async month(chatId) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(500, 30);
-    if (!trades.length) return send(chatId, '📭 No trades in last 30 days.');
+    const result = await fetchTrades(500, 30);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
     
+    const trades = result.trades;
     const buys = trades.filter(t => /buy|purchase/i.test(t.type)).length;
     const sells = trades.length - buys;
     const tickers = Object.entries(trades.reduce((a, t) => (a[t.ticker] = (a[t.ticker] || 0) + 1, a), {}))
@@ -402,9 +412,11 @@ ${tickers.map(([t, c], i) => `${i + 1}. <b>${escapeHtml(t)}</b> — ${c}`).join(
 
   async top(chatId) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(500, 30);
-    if (!trades.length) return send(chatId, '❌ Could not fetch data.');
+    const result = await fetchTrades(500, 30);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
     
+    const trades = result.trades;
     const traders = trades.reduce((a, t) => {
       a[t.name] = a[t.name] || { count: 0, party: t.party };
       a[t.name].count++;
@@ -421,9 +433,11 @@ ${tickers.map(([t, c], i) => `${i + 1}. <b>${escapeHtml(t)}</b> — ${c}`).join(
 
   async politicians(chatId, arg) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(500, 90);
-    if (!trades.length) return send(chatId, '❌ Could not fetch data.');
+    const result = await fetchTrades(500, 90);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 90 days.');
     
+    const trades = result.trades;
     const pols = trades.reduce((a, t) => {
       a[t.name] = a[t.name] || { party: t.party, state: t.state, count: 0 };
       a[t.name].count++;
@@ -473,9 +487,11 @@ ${viewAllBtn}
 
   async tickers(chatId, arg) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(500, 30);
-    if (!trades.length) return send(chatId, '❌ Could not fetch data.');
+    const result = await fetchTrades(500, 30);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
     
+    const trades = result.trades;
     const tickers = trades.reduce((a, t) => {
       if (!t.ticker || t.ticker === 'N/A') return a;
       a[t.ticker] = a[t.ticker] || { company: t.company, buys: 0, sells: 0 };
@@ -530,22 +546,27 @@ ${viewAllBtn}
     if (!safeQuery) return send(chatId, '❌ Invalid search query.');
     
     await send(chatId, `🔍 Searching "${escapeHtml(safeQuery)}"...`);
-    const trades = await fetchTrades(500);
+    const result = await fetchTrades(500);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    
     const q = safeQuery.toLowerCase();
-    const results = trades.filter(t => 
+    const results = result.trades.filter(t => 
       t.name?.toLowerCase().includes(q) || 
       t.ticker?.toLowerCase().includes(q) || 
       t.company?.toLowerCase().includes(q)
     ).slice(0, 10);
     
-    if (!results.length) return send(chatId, `❌ No results for "${escapeHtml(safeQuery)}"`);
+    if (!results.length) return send(chatId, `📭 No results for "${escapeHtml(safeQuery)}"`);
     await send(chatId, `🔍 <b>Results: "${escapeHtml(safeQuery)}"</b>\n\n${results.map((t, i) => fmt(t, i + 1)).join('\n\n')}`);
   },
 
   async stats(chatId) {
     await send(chatId, '⏳ Loading...');
-    const trades = await fetchTrades(500, 30);
-    if (!trades.length) return send(chatId, '❌ Could not fetch data.');
+    const result = await fetchTrades(500, 30);
+    if (!result.success) return send(chatId, '⚠️ <b>Data Unavailable</b>\n\nCould not connect to trade data sources. Please try again in a few minutes.');
+    if (!result.trades.length) return send(chatId, '📭 No trades in last 30 days.');
+    
+    const trades = result.trades;
     
     const buys = trades.filter(t => /buy|purchase/i.test(t.type)).length;
     const sells = trades.length - buys;
@@ -634,7 +655,7 @@ ${group ? '\n<b>👥 GROUP</b>\nAlerts go to all members.' : ''}`);
 <b>🤖 System</b>
 • Status: 🟢 Online
 • Uptime: ${hours}h ${mins}m ${secs}s
-• Version: 3.1.0
+• Version: 3.2.0
 
 <b>⏰ Auto-Alerts</b>
 • Check interval: 60 minutes
@@ -710,10 +731,11 @@ async function processUpdate(u) {
 // ==================== AUTO ALERTS ====================
 async function checkAlerts() {
   log('Checking for new trades...');
-  const trades = await fetchTrades(50);
-  if (!trades.length) return log('No trades fetched.');
+  const result = await fetchTrades(50);
+  if (!result.success) return log('⚠️ Could not fetch trades - all sources failed.');
+  if (!result.trades.length) return log('No new trades in dataset.');
   
-  const newTrades = trades.filter(t => !state.seen.includes(t.id));
+  const newTrades = result.trades.filter(t => !state.seen.includes(t.id));
   newTrades.forEach(t => state.seen.push(t.id));
   
   if (newTrades.length && state.subscribers.length) {
@@ -726,6 +748,8 @@ async function checkAlerts() {
       }
       await delay(300);
     }
+  } else if (newTrades.length === 0) {
+    log('No new trades since last check.');
   }
   
   state.lastCheck = new Date().toISOString();
@@ -734,7 +758,7 @@ async function checkAlerts() {
 
 // ==================== MAIN ====================
 async function main() {
-  console.log('\n🏛️ Congressional Trade Bot v3.0\n');
+  console.log('\n🏛️ Congressional Trade Bot v3.2\n');
   
   if (!CONFIG.token) {
     console.error('❌ TELEGRAM_BOT_TOKEN required');
