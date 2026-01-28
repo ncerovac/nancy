@@ -2,9 +2,10 @@
 
 Real-time Telegram alerts when U.S. Congress members trade stocks.
 
-![Version](https://img.shields.io/badge/version-3.0.0-blue)
+![Version](https://img.shields.io/badge/version-3.1.0-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-green)
 ![License](https://img.shields.io/badge/license-MIT-gray)
+![Security](https://img.shields.io/badge/security-hardened-brightgreen)
 
 ---
 
@@ -18,9 +19,10 @@ Congress members must disclose stock trades within 45 days under the STOCK Act. 
 
 - 🔔 **Real-time alerts** — Get notified when new trades drop
 - 👥 **Multi-user** — Works in DMs and group chats
-- 🔍 **Search** — Find trades by politician or ticker
+- 🔍 **Search** — Find trades by politician or ticker (clickable!)
 - 📊 **Analytics** — Buy/sell ratios, top traders, trends
 - 📈 **Chart links** — One-tap to Yahoo Finance
+- 🔒 **Security hardened** — XSS protection, rate limiting, input validation
 
 ---
 
@@ -34,8 +36,10 @@ Congress members must disclose stock trades within 45 days under the STOCK Act. 
 | `/today` | Last 24 hours |
 | `/week` | Last 7 days |
 | `/month` | Last 30 days + stats |
-| `/politicians` | Browse all active traders |
-| `/tickers` | Browse all traded stocks |
+| `/politicians` | Browse all active traders (clickable) |
+| `/politicians_all` | View complete list |
+| `/tickers` | Browse all traded stocks (clickable) |
+| `/tickers_all` | View complete list |
 | `/search [query]` | Search by name/ticker |
 | `/top` | Most active traders |
 | `/stats` | Market statistics |
@@ -121,12 +125,36 @@ Data sourced from official STOCK Act filings.
 
 ---
 
+## Security
+
+This bot is security-hardened for public deployment:
+
+| Protection | Description |
+|------------|-------------|
+| **XSS Prevention** | All output HTML-escaped |
+| **Input Validation** | Commands, queries, IDs validated |
+| **Rate Limiting** | 1 request/second per user |
+| **Safe File I/O** | Atomic writes, validated JSON parsing |
+| **No Secrets in Code** | Token loaded from environment only |
+
+⚠️ **Never commit your `TELEGRAM_BOT_TOKEN` to the repo!**
+
+---
+
 ## Tech
 
 - **Runtime:** Node.js 18+
 - **APIs:** Telegram Bot API, public trade APIs
 - **Hosting:** Railway, Render, or any Node host
 - **Dependencies:** None (zero npm packages!)
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Yes | Bot token from @BotFather |
 
 ---
 
@@ -139,6 +167,12 @@ For informational purposes only. Not financial advice. Trades may be up to 45 da
 ## License
 
 MIT
+
+---
+
+## Contributing
+
+PRs welcome! Please ensure any changes maintain security standards.
 
 ---
 
