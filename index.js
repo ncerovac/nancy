@@ -75,34 +75,46 @@ const SOURCES = [
   {
     name: 'House Stock Watcher',
     url: 'https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json',
-    parse: data => data.slice(0, 200).map(t => ({
-      id: `${t.representative}-${t.ticker}-${t.transaction_date}`,
-      name: t.representative,
-      party: t.party || '',
-      state: t.state || t.district || '',
-      chamber: 'house',
-      ticker: t.ticker,
-      company: getCompanyName(t.ticker, t.asset_description),
-      type: t.type || t.transaction_type,
-      date: t.transaction_date,
-      value: t.amount,
-    }))
+    parse: data => {
+      // Sort by date FIRST, then take recent ones
+      const sorted = data
+        .map(t => ({
+          id: `${t.representative}-${t.ticker}-${t.transaction_date}`,
+          name: t.representative,
+          party: t.party || '',
+          state: t.state || t.district || '',
+          chamber: 'house',
+          ticker: t.ticker,
+          company: getCompanyName(t.ticker, t.asset_description),
+          type: t.type || t.transaction_type,
+          date: t.transaction_date,
+          value: t.amount,
+        }))
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+      return sorted.slice(0, 500);
+    }
   },
   {
     name: 'Senate Stock Watcher',
     url: 'https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json',
-    parse: data => data.slice(0, 200).map(t => ({
-      id: `${t.senator}-${t.ticker}-${t.transaction_date}`,
-      name: t.senator,
-      party: t.party || '',
-      state: t.state || '',
-      chamber: 'senate',
-      ticker: t.ticker,
-      company: getCompanyName(t.ticker, t.asset_description),
-      type: t.type || t.transaction_type,
-      date: t.transaction_date,
-      value: t.amount,
-    }))
+    parse: data => {
+      // Sort by date FIRST, then take recent ones
+      const sorted = data
+        .map(t => ({
+          id: `${t.senator}-${t.ticker}-${t.transaction_date}`,
+          name: t.senator,
+          party: t.party || '',
+          state: t.state || '',
+          chamber: 'senate',
+          ticker: t.ticker,
+          company: getCompanyName(t.ticker, t.asset_description),
+          type: t.type || t.transaction_type,
+          date: t.transaction_date,
+          value: t.amount,
+        }))
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+      return sorted.slice(0, 500);
+    }
   }
 ];
 
@@ -194,19 +206,44 @@ async function fetchTrades(limit = 100, days = null) {
       log(`Trying ${src.name}...`);
       const res = await fetch(src.url, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(15000)
       });
-      if (!res.ok) continue;
+      if (!res.ok) {
+        log(`${src.name}: HTTP ${res.status}`);
+        continue;
+      }
       
       let trades = src.parse(await res.json());
+      
+      // Sort by date descending (newest first)
+      trades.sort((a, b) => new Date(b.date) - new Date(a.date));
+      
+      // Log newest trade date for debugging
+      if (trades.length > 0) {
+        log(`${src.name}: Newest trade: ${trades[0].date}, Oldest in batch: ${trades[Math.min(9, trades.length-1)].date}`);
+      }
+      
+      // Filter by days if specified
       if (days) {
         const cutoff = Date.now() - days * 86400000;
-        trades = trades.filter(t => new Date(t.date) >= cutoff);
+        const beforeFilter = trades.length;
+        trades = trades.filter(t => {
+          const tradeDate = new Date(t.date);
+          return !isNaN(tradeDate) && tradeDate >= cutoff;
+        });
+        log(`${src.name}: Filtered ${beforeFilter} → ${trades.length} trades (last ${days} days)`);
       }
-      log(`✅ ${src.name}: ${trades.length} trades`);
-      return trades.slice(0, limit);
-    } catch (e) { log(`${src.name}:`, e.message); }
+      
+      if (trades.length > 0) {
+        log(`✅ ${src.name}: Returning ${Math.min(limit, trades.length)} trades`);
+        return trades.slice(0, limit);
+      } else {
+        log(`${src.name}: No trades match criteria, trying next source...`);
+        continue;
+      }
+    } catch (e) { log(`${src.name}: ${e.message}`); }
   }
+  log('❌ All sources failed or returned no data');
   return [];
 }
 
